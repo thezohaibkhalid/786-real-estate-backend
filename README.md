@@ -7,9 +7,6 @@ Go Fiber v2 + PostgreSQL foundation for the existing public Next.js website and 
 ```sh
 cp .env.example .env
 # Edit .env if your PostgreSQL credentials or admin port differ.
-set -a
-. ./.env
-set +a
 docker compose up -d db
 go mod download
 make migrate
@@ -19,7 +16,7 @@ make dev    # or: air
 make run
 ```
 
-The environment is read from the process, not implicitly from files. Compose is for local development only; use separately managed credentials and TLS in production. No database is provisioned or migrated automatically when the API starts.
+The development environment is loaded from `.env`; explicitly exported environment variables take precedence. Compose is for local development only; use separately managed credentials and TLS in production. No database is provisioned or migrated automatically when the API starts.
 The local Postgres container is published on `127.0.0.1:5433` to avoid clashing with other local Postgres projects that may already use `5432`.
 
 - `GET /health/live`: process health.
