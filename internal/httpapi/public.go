@@ -226,7 +226,8 @@ func propertyListSQL(c *fiber.Ctx, purpose string) (string, []any) {
 func propertyListSelect(base, order string, limitParam, offsetParam int) string {
 	return `select id::text, slug::text, title, city::text, area_id::text, area_name,
 area_name as area, type::text, purpose::text, price::float8, size::float8, unit::text,
-unit::text as "sizeUnit", beds, baths, home as featured,
+unit::text as "sizeUnit", beds, baths, home as featured, home_sort_order as "homeSortOrder",
+coalesce((select phone from agents where id = public_properties.agent_id), '') as phone,
 coalesce((select url from property_media where property_id = public_properties.id order by sort_order, id limit 1), '') as img,
 coalesce(nullif(meta_title, ''), title) as meta_title, meta_desc, created_at, updated_at
 from (` + base + `) public_properties order by ` + order + ` limit $` + strconv.Itoa(limitParam) + ` offset $` + strconv.Itoa(offsetParam)

@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -37,6 +36,7 @@ type adminSession struct {
 
 func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
 	api := &adminAPI{db: db, cfg: cfg}
+	router.Use(api.checkAdminOrigin)
 	router.Post("/auth/login", api.login)
 	router.Post("/auth/forgot-password", api.forgotPassword)
 	router.Post("/auth/reset-password", api.resetPassword)
@@ -46,6 +46,8 @@ func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
 	protected.Use(api.requireAuth())
 	protected.Get("/auth/me", api.me)
 	protected.Get("/dashboard", api.dashboard)
+	protected.Get("/homepage-sections", api.listHomepageSections)
+	protected.Patch("/homepage-sections", api.updateHomepageSections)
 	protected.Get("/leads", api.listLeads)
 	protected.Get("/leads/:id", api.getLead)
 	protected.Patch("/leads/:id", api.patchLead)
@@ -53,13 +55,25 @@ func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
 	protected.Post("/properties", api.createAdminProperty)
 	protected.Get("/properties/:id", api.getAdminProperty)
 	protected.Patch("/properties/:id", api.updateAdminProperty)
+	protected.Patch("/properties/:id/home", api.updateAdminPropertyHome)
 	protected.Delete("/properties/:id", api.deleteAdminProperty)
 	protected.Get("/projects", api.listAdminProjects)
 	protected.Post("/projects", api.createAdminProject)
 	protected.Get("/projects/:id", api.getAdminProject)
 	protected.Patch("/projects/:id", api.updateAdminProject)
+	protected.Patch("/projects/:id/home", api.updateAdminProjectHome)
 	protected.Delete("/projects/:id", api.deleteAdminProject)
 	protected.Get("/cities", api.listAdminCities)
+	protected.Get("/agents", api.listAdminAgents)
+	protected.Post("/agents", api.createAdminAgent)
+	protected.Get("/agents/:id", api.getAdminAgent)
+	protected.Patch("/agents/:id", api.updateAdminAgent)
+	protected.Delete("/agents/:id", api.deleteAdminAgent)
+	protected.Get("/areas", api.listAdminAreas)
+	protected.Post("/areas", api.createAdminArea)
+	protected.Get("/areas/:id", api.getAdminArea)
+	protected.Patch("/areas/:id", api.updateAdminArea)
+	protected.Delete("/areas/:id", api.deleteAdminArea)
 }
 
 func (api *adminAPI) forgotPassword(c *fiber.Ctx) error {
@@ -138,16 +152,25 @@ func (api *adminAPI) resetPassword(c *fiber.Ctx) error {
 		}
 		return dbError(c, err)
 	}
-	rows, err := api.db.Query(c.UserContext(), `update admin_users set password_hash = $1 where id = $2`, passwordHash, userID)
+	// Consume the token, update the password, and revoke existing sessions atomically.
+	var changedID string
+	err = api.db.QueryRow(c.UserContext(), `with consumed as (
+  update admin_password_reset_tokens set used_at = now()
+  where token_hash = $1 and admin_user_id = $2 and used_at is null and expires_at > now()
+  returning admin_user_id
+), changed as (
+  update admin_users set password_hash = $3 where id in (select admin_user_id from consumed) returning id
+), revoked as (
+  delete from admin_sessions where admin_user_id in (select id from changed)
+)
+select id::text from changed`, tokenHash, userID, passwordHash).Scan(&changedID)
+	if err == pgx.ErrNoRows {
+		return fail(c, 400, "VALIDATION_ERROR", "Reset link is invalid or expired")
+	}
 	if err != nil {
 		return dbError(c, err)
 	}
-	rows.Close()
-	rows, err = api.db.Query(c.UserContext(), `update admin_password_reset_tokens set used_at = now() where token_hash = $1`, tokenHash)
-	if err != nil {
-		return dbError(c, err)
-	}
-	rows.Close()
+	api.clearSessionCookie(c)
 	return data(c, fiber.Map{"ok": true})
 }
 
@@ -186,25 +209,30 @@ func (api *adminAPI) login(c *fiber.Ctx) error {
 		return fail(c, 401, "UNAUTHENTICATED", "Invalid email or password")
 	}
 
-	sess := adminSession{ID: user.ID, Name: user.Name, Email: user.Email, Role: user.Role, Exp: time.Now().Add(12 * time.Hour).Unix()}
-	token, err := api.signSession(sess)
+	sess := adminSession{ID: user.ID, Name: user.Name, Email: user.Email, Role: user.Role}
+	token, err := randomToken(32)
 	if err != nil {
 		return fail(c, 500, "INTERNAL", "An internal error occurred")
 	}
-	c.Cookie(&fiber.Cookie{
-		Name:     adminSessionCookie,
-		Value:    token,
-		HTTPOnly: true,
-		SameSite: "Lax",
-		Secure:   api.cfg.Env == "production",
-		Path:     "/",
-		Expires:  time.Unix(sess.Exp, 0),
-	})
+	var expires time.Time
+	err = api.db.QueryRow(c.UserContext(), `insert into admin_sessions (token_hash, admin_user_id, expires_at)
+values ($1, $2, now() + interval '30 days') returning expires_at`, hashToken(token), user.ID).Scan(&expires)
+	if err != nil {
+		return dbError(c, err)
+	}
+	api.setSessionCookie(c, token, expires)
 	return data(c, fiber.Map{"user": sessionUser(sess)})
 }
 
 func (api *adminAPI) logout(c *fiber.Ctx) error {
-	c.Cookie(&fiber.Cookie{Name: adminSessionCookie, Value: "", HTTPOnly: true, SameSite: "Lax", Secure: api.cfg.Env == "production", Path: "/", Expires: time.Unix(0, 0)})
+	if token := c.Cookies(adminSessionCookie); token != "" {
+		var removed string
+		err := api.db.QueryRow(c.UserContext(), `delete from admin_sessions where token_hash = $1 returning token_hash`, hashToken(token)).Scan(&removed)
+		if err != nil && err != pgx.ErrNoRows {
+			return dbError(c, err)
+		}
+	}
+	api.clearSessionCookie(c)
 	return data(c, fiber.Map{"ok": true})
 }
 
@@ -219,9 +247,29 @@ func (api *adminAPI) requireAuth() fiber.Handler {
 		if token == "" {
 			return fail(c, 401, "UNAUTHENTICATED", "Login required")
 		}
-		sess, err := api.verifySession(token)
-		if err != nil || sess.Exp < time.Now().Unix() {
+		var sess adminSession
+		var expires time.Time
+		err := api.db.QueryRow(c.UserContext(), `select u.id::text, u.name, u.email::text, u.role::text, s.expires_at
+from admin_sessions s join admin_users u on u.id = s.admin_user_id
+where s.token_hash = $1 and s.expires_at > now()`, hashToken(token)).Scan(&sess.ID, &sess.Name, &sess.Email, &sess.Role, &expires)
+		if err == pgx.ErrNoRows {
+			api.clearSessionCookie(c)
 			return fail(c, 401, "UNAUTHENTICATED", "Login required")
+		}
+		if err != nil {
+			return dbError(c, err)
+		}
+		if time.Until(expires) < adminSessionDuration-24*time.Hour {
+			err = api.db.QueryRow(c.UserContext(), `update admin_sessions set last_seen_at = now(), expires_at = now() + interval '30 days'
+where token_hash = $1 and expires_at > now() returning expires_at`, hashToken(token)).Scan(&expires)
+			if err == pgx.ErrNoRows {
+				api.clearSessionCookie(c)
+				return fail(c, 401, "UNAUTHENTICATED", "Login required")
+			}
+			if err != nil {
+				return dbError(c, err)
+			}
+			api.setSessionCookie(c, token, expires)
 		}
 		c.Locals("adminSession", sess)
 		return c.Next()
@@ -230,43 +278,6 @@ func (api *adminAPI) requireAuth() fiber.Handler {
 
 func sessionUser(sess adminSession) fiber.Map {
 	return fiber.Map{"id": sess.ID, "name": sess.Name, "email": sess.Email, "role": sess.Role}
-}
-
-func (api *adminAPI) signSession(sess adminSession) (string, error) {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	payloadRaw, err := json.Marshal(sess)
-	if err != nil {
-		return "", err
-	}
-	payload := base64.RawURLEncoding.EncodeToString(payloadRaw)
-	unsigned := header + "." + payload
-	mac := hmac.New(sha256.New, []byte(api.cfg.SessionSecret))
-	mac.Write([]byte(unsigned))
-	return unsigned + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
-}
-
-func (api *adminAPI) verifySession(token string) (adminSession, error) {
-	var sess adminSession
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return sess, fmt.Errorf("invalid token")
-	}
-	unsigned := parts[0] + "." + parts[1]
-	mac := hmac.New(sha256.New, []byte(api.cfg.SessionSecret))
-	mac.Write([]byte(unsigned))
-	want := mac.Sum(nil)
-	got, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || !hmac.Equal(got, want) {
-		return sess, fmt.Errorf("invalid token")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return sess, err
-	}
-	if err := json.Unmarshal(payload, &sess); err != nil {
-		return sess, err
-	}
-	return sess, nil
 }
 
 func verifyArgon2id(password, encoded string) (bool, error) {
@@ -523,6 +534,20 @@ func (api *adminAPI) getAdminProperty(c *fiber.Ctx) error {
 	return data(c, item)
 }
 
+func (api *adminAPI) updateAdminPropertyHome(c *fiber.Ctx) error {
+	var req struct {
+		Home *bool `json:"home"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Home == nil {
+		return failFields(c, 400, "VALIDATION_ERROR", "Homepage selection validation failed", map[string]string{"home": "a boolean is required"})
+	}
+	item, err := queryJSON(c.UserContext(), api.db, `update properties set home=$2 where id=$1 returning `+adminPropertyJSON("properties"), c.Params("id"), *req.Home)
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, item)
+}
+
 func (api *adminAPI) createAdminProperty(c *fiber.Ctx) error {
 	var req adminPropertyPayload
 	if err := c.BodyParser(&req); err != nil {
@@ -771,6 +796,20 @@ func (api *adminAPI) getAdminProject(c *fiber.Ctx) error {
 	return data(c, item)
 }
 
+func (api *adminAPI) updateAdminProjectHome(c *fiber.Ctx) error {
+	var req struct {
+		Home *bool `json:"home"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Home == nil {
+		return failFields(c, 400, "VALIDATION_ERROR", "Homepage selection validation failed", map[string]string{"home": "a boolean is required"})
+	}
+	item, err := queryJSON(c.UserContext(), api.db, `update projects set home=$2 where id=$1 returning `+adminProjectJSON("projects"), c.Params("id"), *req.Home)
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, item)
+}
+
 func (api *adminAPI) createAdminProject(c *fiber.Ctx) error {
 	var req adminProjectPayload
 	if err := c.BodyParser(&req); err != nil {
@@ -968,4 +1007,263 @@ func (api *adminAPI) listAdminCities(c *fiber.Ctx) error {
 		return dbError(c, err)
 	}
 	return data(c, items)
+}
+
+type adminAgentPayload struct {
+	Name     string  `json:"name"`
+	Role     string  `json:"role"`
+	Phone    string  `json:"phone"`
+	WhatsApp string  `json:"whatsapp"`
+	Email    string  `json:"email"`
+	Exp      int     `json:"exp"`
+	Deals    int     `json:"deals"`
+	PhotoURL string  `json:"photoUrl"`
+	Bio      string  `json:"bio"`
+	Active   bool    `json:"active"`
+	AreaIDs  []int64 `json:"areaIds"`
+}
+
+func adminAgentJSON(alias string) string {
+	return `jsonb_build_object('id', ` + alias + `.id::text, 'name', ` + alias + `.name, 'role', ` + alias + `.role, 'phone', ` + alias + `.phone, 'whatsapp', ` + alias + `.whatsapp, 'email', ` + alias + `.email::text, 'exp', ` + alias + `.exp, 'deals', ` + alias + `.deals, 'photoUrl', ` + alias + `.photo_url, 'bio', ` + alias + `.bio, 'active', ` + alias + `.active, 'areaIds', coalesce((select jsonb_agg(aa.area_id::text order by aa.area_id) from agent_areas aa where aa.agent_id = ` + alias + `.id), '[]'::jsonb))`
+}
+
+func validateAdminAgent(req adminAgentPayload) map[string]string {
+	fields := map[string]string{}
+	if strings.TrimSpace(req.Name) == "" {
+		fields["name"] = "required"
+	}
+	if strings.TrimSpace(req.Phone) == "" {
+		fields["phone"] = "required"
+	}
+	if strings.TrimSpace(req.Email) == "" || !strings.Contains(req.Email, "@") {
+		fields["email"] = "must be a valid email"
+	}
+	if req.Exp < 0 {
+		fields["exp"] = "must be non-negative"
+	}
+	if req.Deals < 0 {
+		fields["deals"] = "must be non-negative"
+	}
+	return fields
+}
+
+func (api *adminAPI) listAdminAgents(c *fiber.Ctx) error {
+	rows, err := api.db.Query(c.UserContext(), `select `+adminAgentJSON("a")+` as item from agents a order by a.name, a.id`)
+	if err != nil {
+		return dbError(c, err)
+	}
+	items, err := collectAdminJSONRows(rows)
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, items)
+}
+
+func (api *adminAPI) getAdminAgent(c *fiber.Ctx) error {
+	item, err := queryJSON(c.UserContext(), api.db, `select `+adminAgentJSON("a")+` from agents a where a.id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, item)
+}
+
+func (api *adminAPI) createAdminAgent(c *fiber.Ctx) error {
+	var req adminAgentPayload
+	if err := c.BodyParser(&req); err != nil {
+		return fail(c, 400, "VALIDATION_ERROR", "Invalid JSON body")
+	}
+	if fields := validateAdminAgent(req); len(fields) > 0 {
+		return failFields(c, 400, "VALIDATION_ERROR", "Agent validation failed", fields)
+	}
+	item, err := queryJSON(c.UserContext(), api.db, `insert into agents (name, role, phone, whatsapp, email, exp, deals, photo_url, bio, active) values ($1,$2,$3,$4,$5::citext,$6,$7,$8,$9,$10) returning `+adminAgentJSON("agents"), strings.TrimSpace(req.Name), strings.TrimSpace(req.Role), strings.TrimSpace(req.Phone), strings.TrimSpace(req.WhatsApp), strings.TrimSpace(req.Email), req.Exp, req.Deals, strings.TrimSpace(req.PhotoURL), req.Bio, req.Active)
+	if err != nil {
+		return dbError(c, err)
+	}
+	if err := api.replaceAgentAreas(c, item["id"], req.AreaIDs); err != nil {
+		return dbError(c, err)
+	}
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminAgentJSON("a")+` from agents a where a.id=$1`, item["id"])
+	if err != nil {
+		return dbError(c, err)
+	}
+	return c.Status(201).JSON(Response{Data: item, Meta: fiber.Map{}})
+}
+
+func (api *adminAPI) updateAdminAgent(c *fiber.Ctx) error {
+	var req adminAgentPayload
+	if err := c.BodyParser(&req); err != nil {
+		return fail(c, 400, "VALIDATION_ERROR", "Invalid JSON body")
+	}
+	if fields := validateAdminAgent(req); len(fields) > 0 {
+		return failFields(c, 400, "VALIDATION_ERROR", "Agent validation failed", fields)
+	}
+	item, err := queryJSON(c.UserContext(), api.db, `update agents set name=$2, role=$3, phone=$4, whatsapp=$5, email=$6::citext, exp=$7, deals=$8, photo_url=$9, bio=$10, active=$11 where id=$1 returning `+adminAgentJSON("agents"), c.Params("id"), strings.TrimSpace(req.Name), strings.TrimSpace(req.Role), strings.TrimSpace(req.Phone), strings.TrimSpace(req.WhatsApp), strings.TrimSpace(req.Email), req.Exp, req.Deals, strings.TrimSpace(req.PhotoURL), req.Bio, req.Active)
+	if err != nil {
+		return dbError(c, err)
+	}
+	if err := api.replaceAgentAreas(c, c.Params("id"), req.AreaIDs); err != nil {
+		return dbError(c, err)
+	}
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminAgentJSON("a")+` from agents a where a.id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, item)
+}
+
+func (api *adminAPI) deleteAdminAgent(c *fiber.Ctx) error {
+	rows, err := api.db.Query(c.UserContext(), `delete from agents where id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	rows.Close()
+	return data(c, fiber.Map{"ok": true})
+}
+
+func (api *adminAPI) replaceAgentAreas(c *fiber.Ctx, agentID any, areaIDs []int64) error {
+	rows, err := api.db.Query(c.UserContext(), `delete from agent_areas where agent_id=$1`, agentID)
+	if err != nil {
+		return err
+	}
+	rows.Close()
+	for _, areaID := range areaIDs {
+		rows, err := api.db.Query(c.UserContext(), `insert into agent_areas (agent_id, area_id) values ($1,$2) on conflict do nothing`, agentID, areaID)
+		if err != nil {
+			return err
+		}
+		rows.Close()
+	}
+	return nil
+}
+
+type adminAreaPayload struct {
+	Name          string `json:"name"`
+	City          string `json:"city"`
+	CoverImageURL string `json:"coverImageUrl"`
+	H1            string `json:"h1"`
+	MetaTitle     string `json:"metaTitle"`
+	MetaDesc      string `json:"metaDesc"`
+	Description   string `json:"description"`
+	GeneratePages bool   `json:"generatePages"`
+}
+
+func adminAreaJSON(alias string) string {
+	return `jsonb_build_object('id', ` + alias + `.id::text, 'name', ` + alias + `.name, 'city', ` + alias + `.city::text, 'coverImageUrl', ` + alias + `.cover_image_url, 'h1', ` + alias + `.h1, 'metaTitle', ` + alias + `.meta_title, 'metaDesc', ` + alias + `.meta_desc, 'description', ` + alias + `.description)`
+}
+
+func validateAdminArea(req adminAreaPayload) map[string]string {
+	fields := map[string]string{}
+	if strings.TrimSpace(req.Name) == "" {
+		fields["name"] = "required"
+	}
+	if strings.TrimSpace(req.City) == "" {
+		fields["city"] = "required"
+	}
+	return fields
+}
+
+func (api *adminAPI) listAdminAreas(c *fiber.Ctx) error {
+	rows, err := api.db.Query(c.UserContext(), `select `+adminAreaJSON("a")+` as item from areas a order by a.city, a.name`)
+	if err != nil {
+		return dbError(c, err)
+	}
+	items, err := collectAdminJSONRows(rows)
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, items)
+}
+
+func collectAdminJSONRows(rows pgx.Rows) ([]map[string]any, error) {
+	defer rows.Close()
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (api *adminAPI) getAdminArea(c *fiber.Ctx) error {
+	item, err := queryJSON(c.UserContext(), api.db, `select `+adminAreaJSON("a")+` from areas a where a.id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, item)
+}
+
+func (api *adminAPI) createAdminArea(c *fiber.Ctx) error {
+	var req adminAreaPayload
+	if err := c.BodyParser(&req); err != nil {
+		return fail(c, 400, "VALIDATION_ERROR", "Invalid JSON body")
+	}
+	if fields := validateAdminArea(req); len(fields) > 0 {
+		return failFields(c, 400, "VALIDATION_ERROR", "Area validation failed", fields)
+	}
+	item, err := queryJSON(c.UserContext(), api.db, `insert into areas (name, city, cover_image_url, h1, meta_title, meta_desc, description) values ($1,$2::citext,$3,$4,$5,$6,$7) returning `+adminAreaJSON("areas"), strings.TrimSpace(req.Name), strings.TrimSpace(req.City), req.CoverImageURL, req.H1, req.MetaTitle, req.MetaDesc, req.Description)
+	if err != nil {
+		return dbError(c, err)
+	}
+	if req.GeneratePages {
+		areaID := item["id"]
+		templates := []struct {
+			suffix, pageType, purpose, label string
+		}{
+			{"houses-for-sale", "House", "sale", "Houses for Sale"},
+			{"houses-for-rent", "House", "rent", "Houses for Rent"},
+			{"plots-for-sale", "Plot", "sale", "Plots for Sale"},
+			{"apartments-for-sale", "Apartment", "sale", "Apartments for Sale"},
+			{"commercial-for-sale", "Commercial", "sale", "Commercial Property for Sale"},
+		}
+		for _, template := range templates {
+			slug := adminSlug(strings.TrimSpace(req.City) + "-" + strings.TrimSpace(req.Name) + "-" + template.suffix)
+			_, err := api.db.Query(c.UserContext(), `insert into seo_pages (h1, slug, meta_title, meta_desc, city, area_id, type, purpose, published) values ($1,$2::citext,$3,$4,$5::citext,$6,$7::seo_page_type,$8::purpose,true) on conflict (slug) do nothing`,
+				template.label+" in "+req.Name+", "+req.City,
+				slug,
+				template.label+" in "+req.Name+", "+req.City+" | 786 Real Estate",
+				"Browse verified "+strings.ToLower(template.label)+" in "+req.Name+", "+req.City+".",
+				strings.TrimSpace(req.City), areaID, template.pageType, template.purpose)
+			if err != nil {
+				return dbError(c, err)
+			}
+		}
+	}
+	return c.Status(201).JSON(Response{Data: item, Meta: fiber.Map{}})
+}
+
+func adminSlug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("/", "-", "&", "and", " ", "-").Replace(value)
+	return strings.Trim(value, "-")
+}
+
+func (api *adminAPI) updateAdminArea(c *fiber.Ctx) error {
+	var req adminAreaPayload
+	if err := c.BodyParser(&req); err != nil {
+		return fail(c, 400, "VALIDATION_ERROR", "Invalid JSON body")
+	}
+	if fields := validateAdminArea(req); len(fields) > 0 {
+		return failFields(c, 400, "VALIDATION_ERROR", "Area validation failed", fields)
+	}
+	item, err := queryJSON(c.UserContext(), api.db, `update areas set name=$2, city=$3::citext, cover_image_url=$4, h1=$5, meta_title=$6, meta_desc=$7, description=$8 where id=$1 returning `+adminAreaJSON("areas"), c.Params("id"), strings.TrimSpace(req.Name), strings.TrimSpace(req.City), req.CoverImageURL, req.H1, req.MetaTitle, req.MetaDesc, req.Description)
+	if err != nil {
+		return dbError(c, err)
+	}
+	return data(c, item)
+}
+
+func (api *adminAPI) deleteAdminArea(c *fiber.Ctx) error {
+	rows, err := api.db.Query(c.UserContext(), `delete from areas where id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	rows.Close()
+	return data(c, fiber.Map{"ok": true})
 }

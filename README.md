@@ -26,7 +26,7 @@ The local Postgres container is published on `127.0.0.1:5433` to avoid clashing 
 - Public write endpoints: `POST /api/leads` and `POST /api/property-alerts`, with validation, JSON error fields and an in-process 10/hour/IP limiter.
 - Admin auth endpoints: `POST /api/admin/auth/login`, `POST /api/admin/auth/logout`, `GET /api/admin/auth/me`, `POST /api/admin/auth/forgot-password`, and `POST /api/admin/auth/reset-password`.
 - Admin dashboard and leads endpoints: `GET /api/admin/dashboard`, `GET /api/admin/leads`, `GET /api/admin/leads/:id`, `PATCH /api/admin/leads/:id`, and `GET /api/admin/cities`.
-- Development admin login: `admin@786realestate.pk` / `ChangeMe786!`. Change this before production.
+- Fresh databases seed a development bootstrap owner. Provision your real account using the command below before using the panel.
 - Other paths: JSON 404. Full admin CRUD, uploads, and all role-specific write endpoints are still being implemented.
 
 ## Layout
@@ -56,6 +56,20 @@ make build
 
 HTTP tests run without PostgreSQL using a health dependency fake. A real PostgreSQL migration and readiness smoke test should also be run before deployment. Docker builds are optional.
 
-Public CORS permits anonymous requests. Admin CORS permits only ADMIN_ORIGIN plus the equivalent localhost/127.0.0.1 development origin, with credentials; CORS is not authorization. Forgot-password emails use `EMAIL_SERVER_*` SMTP settings and store only hashed reset tokens. Before production, replace the seeded password, set a strong `SESSION_SECRET`, use production SMTP credentials, add login throttling and CSRF/origin protection, and replace the in-process public write limiter with a distributed limiter before running multiple API instances. Logs omit bodies, URLs/query strings and database credentials.
+Public CORS permits anonymous requests. Admin CORS permits only ADMIN_ORIGIN plus the equivalent localhost/127.0.0.1 development origin, with credentials; CORS is not authorization. Admin mutations also validate browser Origin headers. Forgot-password emails use `EMAIL_SERVER_*` SMTP settings and store only hashed reset tokens. Before production, replace the seeded password, use production SMTP credentials, add login throttling, and replace the in-process public write limiter with a distributed limiter before running multiple API instances. Logs omit bodies, URLs/query strings and database credentials.
+
+## Persistent sessions and owner setup
+
+Migration `0009_admin_sessions.sql` stores hashes of opaque session tokens in PostgreSQL. HttpOnly cookies last 30 days of inactivity, renew after a day of authenticated activity, and survive reloads and API restarts. Logout revokes the database session. Password resets atomically consume the reset token, update the password, and revoke all of that user's sessions. Authentication always reads the current account's name, email and role from the database. `SESSION_SECRET` is a legacy configuration field; sessions no longer use signed browser identity payloads.
+
+To replace the fresh-database bootstrap owner, run from this backend directory:
+
+```sh
+go run ./cmd/admin-user --email zohaibkhalid.pk@gmail.com --name 'Zohaib Khalid' --replace-email admin@786realestate.pk
+```
+
+Supply the new password on standard input. For an account already renamed, omit `--replace-email`. The command stores an Argon2id hash, retains an existing account's ID and role, and revokes its previous sessions and password-reset links in a transaction. Never pass a real password as a command-line argument or commit it to an environment file or migration.
+
+Run PostgreSQL authentication tests with `TEST_DATABASE_URL` set to a local database and `go test -race ./...`. Tests create temporary account/session tables on a private connection and never modify existing accounts.
 
 For a container, set HTTP_ADDR=0.0.0.0:8080 and supply DATABASE_URL/ADMIN_ORIGIN at runtime. Run `/app/migrate` as a separate deployment step before starting `/app/api`.
