@@ -7,16 +7,18 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	Env, Address, DatabaseURL, AdminOrigin, SessionSecret            string
-	EmailServerHost, EmailServerUser, EmailServerPassword, EmailFrom string
-	EmailServerPort                                                  int
-	EmailServerSecure                                                bool
-	MaxConns                                                         int32
+	Env, Address, DatabaseURL, AdminOrigin, SessionSecret                    string
+	EmailServerHost, EmailServerUser, EmailServerPassword, EmailFrom         string
+	R2AccountID, R2AccessKeyID, R2SecretAccessKey, R2Bucket, R2PublicBaseURL string
+	EmailServerPort                                                          int
+	EmailServerSecure                                                        bool
+	MaxConns                                                                 int32
 }
 
 func Load() (Config, error) {
@@ -58,6 +60,20 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("EMAIL_SERVER_SECURE must be true or false")
 	}
 	c.EmailServerSecure = emailSecure
+	c.R2AccountID = os.Getenv("R2_ACCOUNT_ID")
+	c.R2AccessKeyID = os.Getenv("R2_ACCESS_KEY_ID")
+	c.R2SecretAccessKey = os.Getenv("R2_SECRET_ACCESS_KEY")
+	c.R2Bucket = value("R2_BUCKET", "786realestates-images")
+	c.R2PublicBaseURL = strings.TrimRight(os.Getenv("R2_PUBLIC_BASE_URL"), "/")
+	if (c.R2AccountID != "") != (c.R2AccessKeyID != "" && c.R2SecretAccessKey != "" && c.R2PublicBaseURL != "") {
+		return c, fmt.Errorf("R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_PUBLIC_BASE_URL must be configured together")
+	}
+	if c.R2PublicBaseURL != "" {
+		parsed, err := url.Parse(c.R2PublicBaseURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return c, fmt.Errorf("R2_PUBLIC_BASE_URL must be an HTTPS origin without a trailing slash or path")
+		}
+	}
 	n, err := strconv.Atoi(value("DB_MAX_CONNS", "10"))
 	if err != nil || n < 1 || n > 100 {
 		return c, fmt.Errorf("DB_MAX_CONNS must be between 1 and 100")

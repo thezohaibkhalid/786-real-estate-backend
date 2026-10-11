@@ -10,6 +10,7 @@ cp .env.example .env
 docker compose up -d db
 go mod download
 make migrate
+make migrate-assets
 # For live reload during development:
 make dev    # or: air
 # Or to run once:
@@ -17,6 +18,7 @@ make run
 ```
 
 The development environment is loaded from `.env`; explicitly exported environment variables take precedence. Compose is for local development only; use separately managed credentials and TLS in production. No database is provisioned or migrated automatically when the API starts.
+`make migrate-assets` uploads seeded property/project images and demo PDFs to the configured R2 bucket and rewrites their database URLs to slug-based public URLs. Run it after `make migrate` when provisioning a database with demo content.
 The local Postgres container is published on `127.0.0.1:5433` to avoid clashing with other local Postgres projects that may already use `5432`.
 
 - `GET /health/live`: process health.
@@ -27,7 +29,8 @@ The local Postgres container is published on `127.0.0.1:5433` to avoid clashing 
 - Admin auth endpoints: `POST /api/admin/auth/login`, `POST /api/admin/auth/logout`, `GET /api/admin/auth/me`, `POST /api/admin/auth/forgot-password`, and `POST /api/admin/auth/reset-password`.
 - Admin dashboard and leads endpoints: `GET /api/admin/dashboard`, `GET /api/admin/leads`, `GET /api/admin/leads/:id`, `PATCH /api/admin/leads/:id`, and `GET /api/admin/cities`.
 - Fresh databases seed a development bootstrap owner. Provision your real account using the command below before using the panel.
-- Other paths: JSON 404. Full admin CRUD, uploads, and all role-specific write endpoints are still being implemented.
+- Admin CRUD endpoints for properties, projects, agents, areas, SEO pages, blog posts, settings, offices and homepage configuration. Nested content mutations use database transactions. `GET /api/admin/summary` supplies live site and lead counts.
+- Other paths: JSON 404.
 
 ## Layout
 
@@ -73,3 +76,18 @@ Supply the new password on standard input. For an account already renamed, omit 
 Run PostgreSQL authentication tests with `TEST_DATABASE_URL` set to a local database and `go test -race ./...`. Tests create temporary account/session tables on a private connection and never modify existing accounts.
 
 For a container, set HTTP_ADDR=0.0.0.0:8080 and supply DATABASE_URL/ADMIN_ORIGIN at runtime. Run `/app/migrate` as a separate deployment step before starting `/app/api`.
+
+## Image storage policy
+
+The authenticated `/api/admin/upload` endpoint accepts JPEG, PNG, GIF, WebP and PDF files up to 25 MiB. File bytes are decoded and validated before storage. Every image passes through `internal/storage.OptimizeImage`, including asset imports using `R2.Put`:
+
+- Preserve aspect ratio and transparency; apply EXIF camera orientation.
+- Resize to a maximum 1,920-pixel longest edge, without enlarging smaller inputs.
+- Encode WebP at quality 82, reducing quality or dimensions when needed to meet the 600 KiB stored-size cap.
+- Strip camera metadata and use unique `.webp` object keys, `image/webp` content type, and immutable cache headers.
+- Reject malformed or unsupported images, inputs over 24 megapixels, and files over 25 MiB. Animated GIF/WebP uses the first frame.
+- Keep project documents as PDF; verify the PDF signature and give admin PDF uploads unique object keys.
+
+Two image-processing workers bound memory use. The Docker runtime includes libwebp for faster encoding; the Go encoder also supports the existing CGO-free build. These rules apply to uploads through the application and asset importer. Previously stored objects are not automatically rewritten.
+
+`TEST_DATABASE_URL=... go test ./internal/httpapi -run TestAdminPersistenceRoundTrips` verifies FAQ/coverage/office round trips, live counts, lead patches and rollback using temporary tables on a private connection. Existing content is untouched. `TEST_R2_UPLOAD=1 go test ./internal/storage -run TestLiveR2WebPUpload -v` explicitly opts into a real R2 upload/format/size check and removes the uniquely named test object afterward; supply normal R2 environment variables to run it.

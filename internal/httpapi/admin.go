@@ -1,20 +1,28 @@
 package httpapi
 
 import (
+	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
 	"net/smtp"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"example.com/786-real-estate/backend/internal/config"
+	"example.com/786-real-estate/backend/internal/storage"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/argon2"
 )
@@ -22,8 +30,18 @@ import (
 const adminSessionCookie = "admin_session"
 
 type adminAPI struct {
-	db  Querier
-	cfg config.Config
+	db           Querier
+	cfg          config.Config
+	r2           *storage.R2
+	mediaCleanup *[]string
+}
+
+func (api *adminAPI) projectDocumentURLs(c *fiber.Ctx, id any) ([]string, error) {
+	urls := make([]string, 5)
+	err := api.db.QueryRow(c.UserContext(), `
+		select brochure_url, plan_pdf_url, price_list_url, master_pdf_url, dev_logo_url
+		from projects where id=$1`, id).Scan(&urls[0], &urls[1], &urls[2], &urls[3], &urls[4])
+	return urls, err
 }
 
 type adminSession struct {
@@ -35,7 +53,11 @@ type adminSession struct {
 }
 
 func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
-	api := &adminAPI{db: db, cfg: cfg}
+	r2, err := storage.NewR2(cfg)
+	if err != nil {
+		panic(err)
+	}
+	api := &adminAPI{db: db, cfg: cfg, r2: r2}
 	router.Use(api.checkAdminOrigin)
 	router.Post("/auth/login", api.login)
 	router.Post("/auth/forgot-password", api.forgotPassword)
@@ -44,36 +66,145 @@ func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
 
 	protected := router.Group("")
 	protected.Use(api.requireAuth())
+	protected.Post("/upload", api.upload)
 	protected.Get("/auth/me", api.me)
 	protected.Get("/dashboard", api.dashboard)
+	protected.Get("/summary", api.summary)
 	protected.Get("/homepage-sections", api.listHomepageSections)
 	protected.Patch("/homepage-sections", api.updateHomepageSections)
 	protected.Get("/leads", api.listLeads)
 	protected.Get("/leads/:id", api.getLead)
 	protected.Patch("/leads/:id", api.patchLead)
 	protected.Get("/properties", api.listAdminProperties)
-	protected.Post("/properties", api.createAdminProperty)
+	protected.Post("/properties", api.atomic((*adminAPI).createAdminProperty))
 	protected.Get("/properties/:id", api.getAdminProperty)
-	protected.Patch("/properties/:id", api.updateAdminProperty)
+	protected.Patch("/properties/:id", api.atomic((*adminAPI).updateAdminProperty))
 	protected.Patch("/properties/:id/home", api.updateAdminPropertyHome)
-	protected.Delete("/properties/:id", api.deleteAdminProperty)
+	protected.Delete("/properties/:id", api.atomic((*adminAPI).deleteAdminProperty))
 	protected.Get("/projects", api.listAdminProjects)
-	protected.Post("/projects", api.createAdminProject)
+	protected.Post("/projects", api.atomic((*adminAPI).createAdminProject))
 	protected.Get("/projects/:id", api.getAdminProject)
-	protected.Patch("/projects/:id", api.updateAdminProject)
+	protected.Patch("/projects/:id", api.atomic((*adminAPI).updateAdminProject))
 	protected.Patch("/projects/:id/home", api.updateAdminProjectHome)
-	protected.Delete("/projects/:id", api.deleteAdminProject)
+	protected.Delete("/projects/:id", api.atomic((*adminAPI).deleteAdminProject))
 	protected.Get("/cities", api.listAdminCities)
 	protected.Get("/agents", api.listAdminAgents)
-	protected.Post("/agents", api.createAdminAgent)
+	protected.Post("/agents", api.atomic((*adminAPI).createAdminAgent))
 	protected.Get("/agents/:id", api.getAdminAgent)
-	protected.Patch("/agents/:id", api.updateAdminAgent)
-	protected.Delete("/agents/:id", api.deleteAdminAgent)
+	protected.Patch("/agents/:id", api.atomic((*adminAPI).updateAdminAgent))
+	protected.Delete("/agents/:id", api.atomic((*adminAPI).deleteAdminAgent))
 	protected.Get("/areas", api.listAdminAreas)
-	protected.Post("/areas", api.createAdminArea)
+	protected.Post("/areas", api.atomic((*adminAPI).createAdminArea))
 	protected.Get("/areas/:id", api.getAdminArea)
-	protected.Patch("/areas/:id", api.updateAdminArea)
-	protected.Delete("/areas/:id", api.deleteAdminArea)
+	protected.Patch("/areas/:id", api.atomic((*adminAPI).updateAdminArea))
+	protected.Delete("/areas/:id", api.atomic((*adminAPI).deleteAdminArea))
+	protected.Get("/seo-pages", api.listAdminSEOPages)
+	protected.Post("/seo-pages", api.atomic((*adminAPI).createAdminSEOPage))
+	protected.Get("/seo-pages/:id", api.getAdminSEOPage)
+	protected.Patch("/seo-pages/:id", api.atomic((*adminAPI).updateAdminSEOPage))
+	protected.Delete("/seo-pages/:id", api.atomic((*adminAPI).deleteAdminSEOPage))
+	protected.Get("/blog-posts", api.listAdminBlogPosts)
+	protected.Post("/blog-posts", api.atomic((*adminAPI).createAdminBlogPost))
+	protected.Get("/blog-posts/:id", api.getAdminBlogPost)
+	protected.Patch("/blog-posts/:id", api.atomic((*adminAPI).updateAdminBlogPost))
+	protected.Delete("/blog-posts/:id", api.atomic((*adminAPI).deleteAdminBlogPost))
+	protected.Get("/blog-posts/:id/sections", api.listAdminBlogSections)
+	protected.Post("/blog-posts/:id/sections", api.createAdminBlogSection)
+	protected.Patch("/blog-post-sections/:sectionId", api.updateAdminBlogSection)
+	protected.Delete("/blog-post-sections/:sectionId", api.deleteAdminBlogSection)
+	protected.Get("/blog-posts/:id/faqs", api.listAdminBlogFAQs)
+	protected.Post("/blog-posts/:id/faqs", api.createAdminBlogFAQ)
+	protected.Patch("/blog-faqs/:faqId", api.updateAdminBlogFAQ)
+	protected.Delete("/blog-faqs/:faqId", api.deleteAdminBlogFAQ)
+	protected.Get("/settings", api.getAdminSettings)
+	protected.Patch("/settings", api.atomic((*adminAPI).updateAdminSettings))
+	protected.Get("/offices", api.listAdminOffices)
+	protected.Patch("/offices", api.atomic((*adminAPI).saveAdminOffices))
+	protected.Post("/offices", api.createAdminOffice)
+	protected.Patch("/offices/:id", api.updateAdminOffice)
+	protected.Delete("/offices/:id", api.deleteAdminOffice)
+}
+
+func (api *adminAPI) upload(c *fiber.Ctx) error {
+	if api.r2 == nil {
+		return fail(c, 503, "STORAGE_UNAVAILABLE", "Image storage is not configured")
+	}
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		return fail(c, 400, "VALIDATION_ERROR", "A file is required")
+	}
+	if fileHeader.Size <= 0 || fileHeader.Size > storage.MaxUploadBytes {
+		return fail(c, 413, "PAYLOAD_TOO_LARGE", "Files must be at most 25 MB")
+	}
+	contentType := fileHeader.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	extension := strings.ToLower(filepath.Ext(fileHeader.Filename))
+	isImage := err == nil && strings.HasPrefix(mediaType, "image/")
+	isPDF := err == nil && mediaType == "application/pdf" && extension == ".pdf"
+	if !isImage && !isPDF {
+		return fail(c, 400, "VALIDATION_ERROR", "Only image and PDF files are allowed")
+	}
+	file, err := fileHeader.Open()
+	if err != nil {
+		return fail(c, 500, "INTERNAL", "Image could not be opened")
+	}
+	defer file.Close()
+	body := bufio.NewReader(file)
+	if isPDF {
+		magic, _ := body.Peek(5)
+		if string(magic) != "%PDF-" {
+			return fail(c, 400, "VALIDATION_ERROR", "The file is not a valid PDF")
+		}
+	}
+	folder := sanitizeUploadPath(c.FormValue("path"))
+	if folder == "" {
+		folder = "uploads"
+	}
+	if isPDF {
+		folder += "/pdf"
+	} else {
+		folder += "/images"
+	}
+	filename := safeUploadFilename(fileHeader.Filename, extension)
+	if isPDF {
+		filename = strings.TrimSuffix(filename, extension) + "-" + uuid.NewString() + ".pdf"
+	}
+	key := folder + "/" + filename
+	ctx, cancel := context.WithTimeout(c.UserContext(), 50*time.Second)
+	defer cancel()
+	url, err := api.r2.Put(ctx, key, body, fileHeader.Size, mediaType)
+	if err != nil {
+		if errors.Is(err, storage.ErrInvalidImage) {
+			return fail(c, 400, "VALIDATION_ERROR", err.Error())
+		}
+		return fail(c, 502, "STORAGE_ERROR", "Image could not be uploaded")
+	}
+	return data(c, fiber.Map{"url": url})
+}
+
+var unsafeUploadPath = regexp.MustCompile(`[^a-zA-Z0-9/_-]+`)
+
+func sanitizeUploadPath(raw string) string {
+	raw = strings.Trim(raw, "/")
+	raw = unsafeUploadPath.ReplaceAllString(raw, "-")
+	parts := strings.Split(raw, "/")
+	safe := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" && part != "." && part != ".." {
+			safe = append(safe, part)
+		}
+	}
+	return strings.Join(safe, "/")
+}
+
+func safeUploadFilename(raw, extension string) string {
+	name := strings.TrimSuffix(filepath.Base(raw), filepath.Ext(raw))
+	name = strings.ToLower(unsafeUploadPath.ReplaceAllString(name, "-"))
+	name = strings.Trim(name, "-")
+	if name == "" {
+		name = "file"
+	}
+	return name + extension
 }
 
 func (api *adminAPI) forgotPassword(c *fiber.Ctx) error {
@@ -449,11 +580,24 @@ func (api *adminAPI) patchLead(c *fiber.Ctx) error {
 		return failFields(c, 400, "VALIDATION_ERROR", "Lead validation failed", fields)
 	}
 	status, _ := req["status"].(string)
-	notes, _ := req["notes"].(string)
+	var notes any
+	if raw, exists := req["notes"]; exists {
+		value, ok := raw.(string)
+		if !ok {
+			return failFields(c, 400, "VALIDATION_ERROR", "Lead validation failed", map[string]string{"notes": "must be text"})
+		}
+		notes = value
+	}
+	if status != "" && status != "New" && status != "Contacted" && status != "Closed" {
+		return failFields(c, 400, "VALIDATION_ERROR", "Lead validation failed", map[string]string{"status": "invalid"})
+	}
 	var agentID any
 	if raw, ok := req["agentId"]; ok && raw != nil && raw != "" {
 		switch v := raw.(type) {
 		case float64:
+			if v < 1 || v != float64(int64(v)) {
+				return failFields(c, 400, "VALIDATION_ERROR", "Lead validation failed", map[string]string{"agentId": "must be a positive integer"})
+			}
 			agentID = int64(v)
 		case string:
 			n, err := strconv.ParseInt(v, 10, 64)
@@ -468,11 +612,11 @@ func (api *adminAPI) patchLead(c *fiber.Ctx) error {
 	item, err := queryJSON(c.UserContext(), api.db, `
 update leads set
   status = coalesce(nullif($2, '')::lead_status, status),
-  agent_id = case when $3::bigint is null then agent_id else $3::bigint end,
+  agent_id = case when $5::boolean then $3::bigint else agent_id end,
   notes = coalesce($4, notes)
 where id = $1
 returning jsonb_build_object('id', id::text, 'name', name, 'phone', phone, 'form', form::text, 'status', status::text, 'agentId', agent_id::text, 'notes', notes)`,
-		c.Params("id"), status, agentID, notes)
+		c.Params("id"), status, agentID, notes, hasKey(req, "agentId"))
 	if err != nil {
 		return dbError(c, err)
 	}
@@ -593,16 +737,26 @@ func (api *adminAPI) updateAdminProperty(c *fiber.Ctx) error {
 	if err := api.replacePropertyMedia(c, c.Params("id"), req.Media); err != nil {
 		return dbError(c, err)
 	}
-	item, _ = queryJSON(c.UserContext(), api.db, `select `+adminPropertyJSON("p")+` from properties p where p.id=$1`, c.Params("id"))
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminPropertyJSON("p")+` from properties p where p.id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
 	return data(c, item)
 }
 
 func (api *adminAPI) deleteAdminProperty(c *fiber.Ctx) error {
+	urls, err := api.mediaURLs(c, "property_media", "property_id", c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
 	rows, err := api.db.Query(c.UserContext(), `delete from properties where id=$1`, c.Params("id"))
 	if err != nil {
 		return dbError(c, err)
 	}
 	rows.Close()
+	if err := api.deleteUnreferencedMedia(c, urls); err != nil {
+		return fail(c, 502, "STORAGE_ERROR", "Property was deleted, but some images could not be removed from storage")
+	}
 	return data(c, fiber.Map{"ok": true})
 }
 
@@ -635,6 +789,10 @@ func validateAdminProperty(req adminPropertyPayload) map[string]string {
 }
 
 func (api *adminAPI) replacePropertyMedia(c *fiber.Ctx, id any, groups []adminMediaGroup) error {
+	oldURLs, err := api.mediaURLs(c, "property_media", "property_id", id)
+	if err != nil {
+		return err
+	}
 	rows, err := api.db.Query(c.UserContext(), `delete from property_media where property_id=$1`, id)
 	if err != nil {
 		return err
@@ -652,6 +810,85 @@ func (api *adminAPI) replacePropertyMedia(c *fiber.Ctx, id any, groups []adminMe
 			}
 			rows.Close()
 			order++
+		}
+	}
+	newURLs := map[string]bool{}
+	for _, g := range groups {
+		for _, mediaURL := range g.URLs {
+			if strings.TrimSpace(mediaURL) != "" {
+				newURLs[strings.TrimSpace(mediaURL)] = true
+			}
+		}
+	}
+	for _, mediaURL := range oldURLs {
+		if !newURLs[mediaURL] {
+			if err := api.deleteUnreferencedMedia(c, []string{mediaURL}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (api *adminAPI) mediaURLs(c *fiber.Ctx, table, column string, id any) ([]string, error) {
+	rows, err := api.db.Query(c.UserContext(), `select url from `+table+` where `+column+`=$1`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var urls []string
+	for rows.Next() {
+		var mediaURL string
+		if err := rows.Scan(&mediaURL); err != nil {
+			return nil, err
+		}
+		urls = append(urls, mediaURL)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return urls, nil
+}
+
+func (api *adminAPI) deleteUnreferencedMedia(c *fiber.Ctx, urls []string) error {
+	if api.mediaCleanup != nil {
+		*api.mediaCleanup = append(*api.mediaCleanup, urls...)
+		return nil
+	}
+	if api.r2 == nil {
+		return nil
+	}
+	for _, mediaURL := range urls {
+		if strings.TrimSpace(mediaURL) == "" {
+			continue
+		}
+		var references int
+		if err := api.db.QueryRow(c.UserContext(), `
+			select
+				(select count(*) from property_media where url=$1) +
+				(select count(*) from project_media where url=$1) +
+				(select count(*) from projects where brochure_url=$1) +
+				(select count(*) from projects where plan_pdf_url=$1) +
+				(select count(*) from projects where price_list_url=$1) +
+				(select count(*) from projects where master_pdf_url=$1) +
+				(select count(*) from projects where dev_logo_url=$1) +
+				(select count(*) from areas where cover_image_url=$1) +
+				(select count(*) from agents where photo_url=$1) +
+				(select count(*) from blog_posts where cover_image_url=$1) +
+				(select count(*) from testimonials where photo_url=$1) +
+				(select count(*) from site_settings where hero_image_url=$1) +
+                (select count(*) from properties where strpos(description,$1)>0) +
+                (select count(*) from projects where strpos(description,$1)>0 or strpos(dev_about,$1)>0) +
+                (select count(*) from areas where strpos(description,$1)>0) +
+                (select count(*) from seo_pages where strpos(intro,$1)>0 or strpos(content,$1)>0) +
+                (select count(*) from blog_posts where strpos(body,$1)>0) +
+                (select count(*) from blog_post_sections where strpos(body,$1)>0)`, mediaURL).Scan(&references); err != nil {
+			return err
+		}
+		if references == 0 && api.r2 != nil {
+			if err := api.r2.DeleteURL(c.UserContext(), mediaURL); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -692,6 +929,7 @@ func nullableID(raw any) (any, error) {
 }
 
 type adminProjectPayload struct {
+	FAQs            []adminFAQPayload `json:"faqs"`
 	Name            string            `json:"name"`
 	Tagline         string            `json:"tagline"`
 	Developer       string            `json:"developer"`
@@ -834,7 +1072,13 @@ returning `+adminProjectJSON("projects"), req.Name, req.Tagline, req.Developer, 
 	if err := api.replaceProjectChildren(c, id, req); err != nil {
 		return dbError(c, err)
 	}
-	item, _ = queryJSON(c.UserContext(), api.db, `select `+adminProjectJSON("p")+` from projects p where p.id=$1`, id)
+	if err := api.replaceFAQs(c, "project", id, req.FAQs); err != nil {
+		return dbError(c, err)
+	}
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminProjectJSON("p")+` from projects p where p.id=$1`, id)
+	if err != nil {
+		return dbError(c, err)
+	}
 	return c.Status(201).JSON(Response{Data: item, Meta: fiber.Map{}})
 }
 
@@ -852,6 +1096,10 @@ func (api *adminAPI) updateAdminProject(c *fiber.Ctx) error {
 		return failFields(c, 400, "VALIDATION_ERROR", "Project validation failed", map[string]string{"agentId": "must be an integer"})
 	}
 	progressDate := nullableDate(req.ProgressDate)
+	oldDocumentURLs, err := api.projectDocumentURLs(c, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
 	item, err := queryJSON(c.UserContext(), api.db, `update projects set name=$2, tagline=$3, developer=$4, city=$5::citext, area_id=$6, address=$7, status=$8::project_status, from_price=$9, possession=$10, size=$11, approval=$12, noc=$13, types=$14, down_pct=$15, plan_years=$16, agent_id=$17, brochure_url=$18, plan_pdf_url=$19, price_list_url=$20, master_pdf_url=$21, gate_downloads=$22, description=$23, dev_about=$24, dev_logo_url=$25, dev_projects=$26, dev_years=$27, dev_families=$28, price_note=$29, progress_date=$30, youtube=$31, maps=$32, custom_amenities=$33, home=$34, active=$35, slug=$36::citext, meta_title=$37, meta_desc=$38 where id=$1 returning `+adminProjectJSON("projects"), c.Params("id"), req.Name, req.Tagline, req.Developer, req.City, req.AreaID, req.Address, req.Status, req.FromPrice, req.Possession, req.Size, req.Approval, req.Noc, req.Types, req.DownPct, req.PlanYears, agentID, req.BrochureURL, req.PlanPdfURL, req.PriceListURL, req.MasterPdfURL, req.GateDownloads, req.Description, req.DevAbout, req.DevLogoURL, req.DevProjects, req.DevYears, req.DevFamilies, req.PriceNote, progressDate, req.Youtube, req.Maps, req.CustomAmenities, req.Home, req.Active, req.Slug, req.MetaTitle, req.MetaDesc)
 	if err != nil {
 		return dbError(c, err)
@@ -859,21 +1107,50 @@ func (api *adminAPI) updateAdminProject(c *fiber.Ctx) error {
 	if err := api.replaceProjectChildren(c, c.Params("id"), req); err != nil {
 		return dbError(c, err)
 	}
-	item, _ = queryJSON(c.UserContext(), api.db, `select `+adminProjectJSON("p")+` from projects p where p.id=$1`, c.Params("id"))
+	newDocumentURLs := []string{req.BrochureURL, req.PlanPdfURL, req.PriceListURL, req.MasterPdfURL, req.DevLogoURL}
+	for i, oldURL := range oldDocumentURLs {
+		if i < len(newDocumentURLs) && oldURL != newDocumentURLs[i] {
+			if err := api.deleteUnreferencedMedia(c, []string{oldURL}); err != nil {
+				return fail(c, 502, "STORAGE_ERROR", "Project was updated, but an old document could not be removed")
+			}
+		}
+	}
+	if err := api.replaceFAQs(c, "project", c.Params("id"), req.FAQs); err != nil {
+		return dbError(c, err)
+	}
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminProjectJSON("p")+` from projects p where p.id=$1`, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
 	return data(c, item)
 }
 
 func (api *adminAPI) deleteAdminProject(c *fiber.Ctx) error {
+	if err := api.replaceFAQs(c, "project", c.Params("id"), []adminFAQPayload{}); err != nil {
+		return dbError(c, err)
+	}
+	urls, err := api.mediaURLs(c, "project_media", "project_id", c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	documents, err := api.projectDocumentURLs(c, c.Params("id"))
+	if err != nil {
+		return dbError(c, err)
+	}
+	urls = append(urls, documents...)
 	rows, err := api.db.Query(c.UserContext(), `delete from projects where id=$1`, c.Params("id"))
 	if err != nil {
 		return dbError(c, err)
 	}
 	rows.Close()
+	if err := api.deleteUnreferencedMedia(c, urls); err != nil {
+		return fail(c, 502, "STORAGE_ERROR", "Project was deleted, but some images could not be removed from storage")
+	}
 	return data(c, fiber.Map{"ok": true})
 }
 
 func validateAdminProject(req adminProjectPayload) map[string]string {
-	fields := map[string]string{}
+	fields := validateFAQs(req.FAQs)
 	if strings.TrimSpace(req.Name) == "" {
 		fields["name"] = "required"
 	}
@@ -900,6 +1177,10 @@ func nullableDate(raw string) any {
 }
 
 func (api *adminAPI) replaceProjectChildren(c *fiber.Ctx, id any, req adminProjectPayload) error {
+	oldMediaURLs, err := api.mediaURLs(c, "project_media", "project_id", id)
+	if err != nil {
+		return err
+	}
 	for _, table := range []string{"project_media", "project_units", "project_payment_stages", "project_floor_plans", "project_progress_stages", "project_nearby_places", "project_amenities"} {
 		rows, err := api.db.Query(c.UserContext(), `delete from `+table+` where project_id=$1`, id)
 		if err != nil {
@@ -907,18 +1188,27 @@ func (api *adminAPI) replaceProjectChildren(c *fiber.Ctx, id any, req adminProje
 		}
 		rows.Close()
 	}
+	newMediaURLs := map[string]bool{}
 	order := 0
 	for _, g := range req.Media {
 		for _, url := range g.URLs {
 			if strings.TrimSpace(url) == "" {
 				continue
 			}
+			newMediaURLs[strings.TrimSpace(url)] = true
 			rows, err := api.db.Query(c.UserContext(), `insert into project_media (project_id, category, url, sort_order) values ($1,$2,$3,$4)`, id, g.Category, strings.TrimSpace(url), order)
 			if err != nil {
 				return err
 			}
 			rows.Close()
 			order++
+		}
+	}
+	for _, mediaURL := range oldMediaURLs {
+		if !newMediaURLs[mediaURL] {
+			if err := api.deleteUnreferencedMedia(c, []string{mediaURL}); err != nil {
+				return err
+			}
 		}
 	}
 	for i, u := range req.Units {
@@ -994,7 +1284,7 @@ func (api *adminAPI) replaceProjectChildren(c *fiber.Ctx, id any, req adminProje
 }
 
 func adminProjectJSON(a string) string {
-	return `jsonb_build_object('id', ` + a + `.id::text, 'name', ` + a + `.name, 'tagline', ` + a + `.tagline, 'developer', ` + a + `.developer, 'city', ` + a + `.city::text, 'areaId', ` + a + `.area_id::text, 'address', ` + a + `.address, 'status', ` + a + `.status::text, 'fromPrice', ` + a + `.from_price::float8, 'possession', ` + a + `.possession, 'size', ` + a + `.size, 'approval', ` + a + `.approval, 'noc', ` + a + `.noc, 'types', ` + a + `.types, 'downPct', ` + a + `.down_pct, 'planYears', ` + a + `.plan_years, 'agentId', ` + a + `.agent_id::text, 'brochureUrl', ` + a + `.brochure_url, 'planPdfUrl', ` + a + `.plan_pdf_url, 'priceListUrl', ` + a + `.price_list_url, 'masterPdfUrl', ` + a + `.master_pdf_url, 'gateDownloads', ` + a + `.gate_downloads, 'description', ` + a + `.description, 'devAbout', ` + a + `.dev_about, 'devLogoUrl', ` + a + `.dev_logo_url, 'devProjects', ` + a + `.dev_projects, 'devYears', ` + a + `.dev_years, 'devFamilies', ` + a + `.dev_families, 'priceNote', ` + a + `.price_note, 'progressDate', coalesce(` + a + `.progress_date::text, ''), 'youtube', ` + a + `.youtube, 'maps', ` + a + `.maps, 'customAmenities', ` + a + `.custom_amenities, 'home', ` + a + `.home, 'active', ` + a + `.active, 'slug', ` + a + `.slug::text, 'metaTitle', ` + a + `.meta_title, 'metaDesc', ` + a + `.meta_desc, 'media', coalesce((select jsonb_agg(jsonb_build_object('category', category, 'urls', urls) order by first_order) from (select category, array_agg(url order by sort_order, id) as urls, min(sort_order) as first_order from project_media where project_id = ` + a + `.id group by category) m), '[]'::jsonb), 'units', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'category', category, 'name', name, 'size', size, 'price', price::float8, 'sortOrder', sort_order) order by sort_order,id) from project_units where project_id=` + a + `.id), '[]'::jsonb), 'paymentStages', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'label', label, 'pct', pct::float8, 'count', count, 'sortOrder', sort_order) order by sort_order,id) from project_payment_stages where project_id=` + a + `.id), '[]'::jsonb), 'floorPlans', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'label', label, 'coveredArea', covered_area, 'beds', beds, 'baths', baths, 'balcony', balcony, 'price', price::float8, 'sortOrder', sort_order) order by sort_order,id) from project_floor_plans where project_id=` + a + `.id), '[]'::jsonb), 'progressStages', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'label', label, 'pct', pct, 'note', note, 'sortOrder', sort_order) order by sort_order,id) from project_progress_stages where project_id=` + a + `.id), '[]'::jsonb), 'nearbyPlaces', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'place', place, 'minutes', minutes, 'sortOrder', sort_order) order by sort_order,id) from project_nearby_places where project_id=` + a + `.id), '[]'::jsonb), 'amenities', coalesce((select jsonb_agg(amenity order by amenity) from project_amenities where project_id=` + a + `.id), '[]'::jsonb), 'createdAt', ` + a + `.created_at)`
+	return `jsonb_build_object('id', ` + a + `.id::text, 'name', ` + a + `.name, 'tagline', ` + a + `.tagline, 'developer', ` + a + `.developer, 'city', ` + a + `.city::text, 'areaId', ` + a + `.area_id::text, 'address', ` + a + `.address, 'status', ` + a + `.status::text, 'fromPrice', ` + a + `.from_price::float8, 'possession', ` + a + `.possession, 'size', ` + a + `.size, 'approval', ` + a + `.approval, 'noc', ` + a + `.noc, 'types', ` + a + `.types, 'downPct', ` + a + `.down_pct, 'planYears', ` + a + `.plan_years, 'agentId', ` + a + `.agent_id::text, 'brochureUrl', ` + a + `.brochure_url, 'planPdfUrl', ` + a + `.plan_pdf_url, 'priceListUrl', ` + a + `.price_list_url, 'masterPdfUrl', ` + a + `.master_pdf_url, 'gateDownloads', ` + a + `.gate_downloads, 'description', ` + a + `.description, 'devAbout', ` + a + `.dev_about, 'devLogoUrl', ` + a + `.dev_logo_url, 'devProjects', ` + a + `.dev_projects, 'devYears', ` + a + `.dev_years, 'devFamilies', ` + a + `.dev_families, 'priceNote', ` + a + `.price_note, 'progressDate', coalesce(` + a + `.progress_date::text, ''), 'youtube', ` + a + `.youtube, 'maps', ` + a + `.maps, 'customAmenities', ` + a + `.custom_amenities, 'home', ` + a + `.home, 'active', ` + a + `.active, 'slug', ` + a + `.slug::text, 'metaTitle', ` + a + `.meta_title, 'metaDesc', ` + a + `.meta_desc, 'media', coalesce((select jsonb_agg(jsonb_build_object('category', category, 'urls', urls) order by first_order) from (select category, array_agg(url order by sort_order, id) as urls, min(sort_order) as first_order from project_media where project_id = ` + a + `.id group by category) m), '[]'::jsonb), 'units', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'category', category, 'name', name, 'size', size, 'price', price::float8, 'sortOrder', sort_order) order by sort_order,id) from project_units where project_id=` + a + `.id), '[]'::jsonb), 'paymentStages', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'label', label, 'pct', pct::float8, 'count', count, 'sortOrder', sort_order) order by sort_order,id) from project_payment_stages where project_id=` + a + `.id), '[]'::jsonb), 'floorPlans', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'label', label, 'coveredArea', covered_area, 'beds', beds, 'baths', baths, 'balcony', balcony, 'price', price::float8, 'sortOrder', sort_order) order by sort_order,id) from project_floor_plans where project_id=` + a + `.id), '[]'::jsonb), 'progressStages', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'label', label, 'pct', pct, 'note', note, 'sortOrder', sort_order) order by sort_order,id) from project_progress_stages where project_id=` + a + `.id), '[]'::jsonb), 'nearbyPlaces', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'projectId', project_id::text, 'place', place, 'minutes', minutes, 'sortOrder', sort_order) order by sort_order,id) from project_nearby_places where project_id=` + a + `.id), '[]'::jsonb), 'amenities', coalesce((select jsonb_agg(amenity order by amenity) from project_amenities where project_id=` + a + `.id), '[]'::jsonb), 'createdAt', ` + a + `.created_at, 'faqs', ` + adminFAQsJSON("project", a) + `)`
 }
 
 func (api *adminAPI) listAdminCities(c *fiber.Ctx) error {
@@ -1024,7 +1314,7 @@ type adminAgentPayload struct {
 }
 
 func adminAgentJSON(alias string) string {
-	return `jsonb_build_object('id', ` + alias + `.id::text, 'name', ` + alias + `.name, 'role', ` + alias + `.role, 'phone', ` + alias + `.phone, 'whatsapp', ` + alias + `.whatsapp, 'email', ` + alias + `.email::text, 'exp', ` + alias + `.exp, 'deals', ` + alias + `.deals, 'photoUrl', ` + alias + `.photo_url, 'bio', ` + alias + `.bio, 'active', ` + alias + `.active, 'areaIds', coalesce((select jsonb_agg(aa.area_id::text order by aa.area_id) from agent_areas aa where aa.agent_id = ` + alias + `.id), '[]'::jsonb))`
+	return `jsonb_build_object('id', ` + alias + `.id::text, 'name', ` + alias + `.name, 'role', ` + alias + `.role, 'phone', ` + alias + `.phone, 'whatsapp', ` + alias + `.whatsapp, 'email', ` + alias + `.email::text, 'exp', ` + alias + `.exp, 'deals', ` + alias + `.deals, 'photoUrl', ` + alias + `.photo_url, 'bio', ` + alias + `.bio, 'active', ` + alias + `.active, 'listingCount', (select count(*) from properties where agent_id = ` + alias + `.id), 'areaIds', coalesce((select jsonb_agg(aa.area_id::text order by aa.area_id) from agent_areas aa where aa.agent_id = ` + alias + `.id), '[]'::jsonb))`
 }
 
 func validateAdminAgent(req adminAgentPayload) map[string]string {
@@ -1097,12 +1387,21 @@ func (api *adminAPI) updateAdminAgent(c *fiber.Ctx) error {
 	if fields := validateAdminAgent(req); len(fields) > 0 {
 		return failFields(c, 400, "VALIDATION_ERROR", "Agent validation failed", fields)
 	}
+	var oldPhotoURL string
+	if err := api.db.QueryRow(c.UserContext(), `select photo_url from agents where id=$1`, c.Params("id")).Scan(&oldPhotoURL); err != nil {
+		return dbError(c, err)
+	}
 	item, err := queryJSON(c.UserContext(), api.db, `update agents set name=$2, role=$3, phone=$4, whatsapp=$5, email=$6::citext, exp=$7, deals=$8, photo_url=$9, bio=$10, active=$11 where id=$1 returning `+adminAgentJSON("agents"), c.Params("id"), strings.TrimSpace(req.Name), strings.TrimSpace(req.Role), strings.TrimSpace(req.Phone), strings.TrimSpace(req.WhatsApp), strings.TrimSpace(req.Email), req.Exp, req.Deals, strings.TrimSpace(req.PhotoURL), req.Bio, req.Active)
 	if err != nil {
 		return dbError(c, err)
 	}
 	if err := api.replaceAgentAreas(c, c.Params("id"), req.AreaIDs); err != nil {
 		return dbError(c, err)
+	}
+	if oldPhotoURL != req.PhotoURL {
+		if err := api.deleteUnreferencedMedia(c, []string{oldPhotoURL}); err != nil {
+			return fail(c, 502, "STORAGE_ERROR", "Agent was updated, but the old image could not be removed")
+		}
 	}
 	item, err = queryJSON(c.UserContext(), api.db, `select `+adminAgentJSON("a")+` from agents a where a.id=$1`, c.Params("id"))
 	if err != nil {
@@ -1112,11 +1411,18 @@ func (api *adminAPI) updateAdminAgent(c *fiber.Ctx) error {
 }
 
 func (api *adminAPI) deleteAdminAgent(c *fiber.Ctx) error {
+	var photoURL string
+	if err := api.db.QueryRow(c.UserContext(), `select photo_url from agents where id=$1`, c.Params("id")).Scan(&photoURL); err != nil {
+		return dbError(c, err)
+	}
 	rows, err := api.db.Query(c.UserContext(), `delete from agents where id=$1`, c.Params("id"))
 	if err != nil {
 		return dbError(c, err)
 	}
 	rows.Close()
+	if err := api.deleteUnreferencedMedia(c, []string{photoURL}); err != nil {
+		return fail(c, 502, "STORAGE_ERROR", "Agent was deleted, but its image could not be removed from storage")
+	}
 	return data(c, fiber.Map{"ok": true})
 }
 
@@ -1137,22 +1443,23 @@ func (api *adminAPI) replaceAgentAreas(c *fiber.Ctx, agentID any, areaIDs []int6
 }
 
 type adminAreaPayload struct {
-	Name          string `json:"name"`
-	City          string `json:"city"`
-	CoverImageURL string `json:"coverImageUrl"`
-	H1            string `json:"h1"`
-	MetaTitle     string `json:"metaTitle"`
-	MetaDesc      string `json:"metaDesc"`
-	Description   string `json:"description"`
-	GeneratePages bool   `json:"generatePages"`
+	FAQs          []adminFAQPayload `json:"faqs"`
+	Name          string            `json:"name"`
+	City          string            `json:"city"`
+	CoverImageURL string            `json:"coverImageUrl"`
+	H1            string            `json:"h1"`
+	MetaTitle     string            `json:"metaTitle"`
+	MetaDesc      string            `json:"metaDesc"`
+	Description   string            `json:"description"`
+	GeneratePages bool              `json:"generatePages"`
 }
 
 func adminAreaJSON(alias string) string {
-	return `jsonb_build_object('id', ` + alias + `.id::text, 'name', ` + alias + `.name, 'city', ` + alias + `.city::text, 'coverImageUrl', ` + alias + `.cover_image_url, 'h1', ` + alias + `.h1, 'metaTitle', ` + alias + `.meta_title, 'metaDesc', ` + alias + `.meta_desc, 'description', ` + alias + `.description)`
+	return `jsonb_build_object('id', ` + alias + `.id::text, 'name', ` + alias + `.name, 'city', ` + alias + `.city::text, 'coverImageUrl', ` + alias + `.cover_image_url, 'h1', ` + alias + `.h1, 'metaTitle', ` + alias + `.meta_title, 'metaDesc', ` + alias + `.meta_desc, 'description', ` + alias + `.description, 'listingCount', (select count(*) from properties where area_id = ` + alias + `.id), 'seoPageCount', (select count(*) from seo_pages where area_id = ` + alias + `.id), 'faqs', ` + adminFAQsJSON("area", alias) + `)`
 }
 
 func validateAdminArea(req adminAreaPayload) map[string]string {
-	fields := map[string]string{}
+	fields := validateFAQs(req.FAQs)
 	if strings.TrimSpace(req.Name) == "" {
 		fields["name"] = "required"
 	}
@@ -1223,8 +1530,8 @@ func (api *adminAPI) createAdminArea(c *fiber.Ctx) error {
 			{"commercial-for-sale", "Commercial", "sale", "Commercial Property for Sale"},
 		}
 		for _, template := range templates {
-			slug := adminSlug(strings.TrimSpace(req.City) + "-" + strings.TrimSpace(req.Name) + "-" + template.suffix)
-			_, err := api.db.Query(c.UserContext(), `insert into seo_pages (h1, slug, meta_title, meta_desc, city, area_id, type, purpose, published) values ($1,$2::citext,$3,$4,$5::citext,$6,$7::seo_page_type,$8::purpose,true) on conflict (slug) do nothing`,
+			slug := adminSlug(req.City) + "/" + adminSlug(req.Name) + "/" + template.suffix
+			rows, err := api.db.Query(c.UserContext(), `insert into seo_pages (h1, slug, meta_title, meta_desc, city, area_id, type, purpose, published) values ($1,$2::citext,$3,$4,$5::citext,$6,$7::seo_page_type,$8::purpose,true) on conflict (slug) do nothing`,
 				template.label+" in "+req.Name+", "+req.City,
 				slug,
 				template.label+" in "+req.Name+", "+req.City+" | 786 Real Estate",
@@ -1233,15 +1540,23 @@ func (api *adminAPI) createAdminArea(c *fiber.Ctx) error {
 			if err != nil {
 				return dbError(c, err)
 			}
+			rows.Close()
 		}
+	}
+	if err := api.replaceFAQs(c, "area", item["id"], req.FAQs); err != nil {
+		return dbError(c, err)
+	}
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminAreaJSON("a")+` from areas a where a.id=$1`, item["id"])
+	if err != nil {
+		return dbError(c, err)
 	}
 	return c.Status(201).JSON(Response{Data: item, Meta: fiber.Map{}})
 }
 
 func adminSlug(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.NewReplacer("/", "-", "&", "and", " ", "-").Replace(value)
-	return strings.Trim(value, "-")
+	value = strings.ReplaceAll(value, "&", "and")
+	return strings.Trim(regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(value, "-"), "-")
 }
 
 func (api *adminAPI) updateAdminArea(c *fiber.Ctx) error {
@@ -1252,7 +1567,23 @@ func (api *adminAPI) updateAdminArea(c *fiber.Ctx) error {
 	if fields := validateAdminArea(req); len(fields) > 0 {
 		return failFields(c, 400, "VALIDATION_ERROR", "Area validation failed", fields)
 	}
+	var oldCoverURL string
+	if err := api.db.QueryRow(c.UserContext(), `select cover_image_url from areas where id=$1`, c.Params("id")).Scan(&oldCoverURL); err != nil {
+		return dbError(c, err)
+	}
 	item, err := queryJSON(c.UserContext(), api.db, `update areas set name=$2, city=$3::citext, cover_image_url=$4, h1=$5, meta_title=$6, meta_desc=$7, description=$8 where id=$1 returning `+adminAreaJSON("areas"), c.Params("id"), strings.TrimSpace(req.Name), strings.TrimSpace(req.City), req.CoverImageURL, req.H1, req.MetaTitle, req.MetaDesc, req.Description)
+	if err != nil {
+		return dbError(c, err)
+	}
+	if oldCoverURL != req.CoverImageURL {
+		if err := api.deleteUnreferencedMedia(c, []string{oldCoverURL}); err != nil {
+			return fail(c, 502, "STORAGE_ERROR", "Area was updated, but the old image could not be removed")
+		}
+	}
+	if err := api.replaceFAQs(c, "area", item["id"], req.FAQs); err != nil {
+		return dbError(c, err)
+	}
+	item, err = queryJSON(c.UserContext(), api.db, `select `+adminAreaJSON("a")+` from areas a where a.id=$1`, item["id"])
 	if err != nil {
 		return dbError(c, err)
 	}
@@ -1260,10 +1591,20 @@ func (api *adminAPI) updateAdminArea(c *fiber.Ctx) error {
 }
 
 func (api *adminAPI) deleteAdminArea(c *fiber.Ctx) error {
+	if err := api.replaceFAQs(c, "area", c.Params("id"), []adminFAQPayload{}); err != nil {
+		return dbError(c, err)
+	}
+	var coverURL string
+	if err := api.db.QueryRow(c.UserContext(), `select cover_image_url from areas where id=$1`, c.Params("id")).Scan(&coverURL); err != nil {
+		return dbError(c, err)
+	}
 	rows, err := api.db.Query(c.UserContext(), `delete from areas where id=$1`, c.Params("id"))
 	if err != nil {
 		return dbError(c, err)
 	}
 	rows.Close()
+	if err := api.deleteUnreferencedMedia(c, []string{coverURL}); err != nil {
+		return fail(c, 502, "STORAGE_ERROR", "Area was deleted, but its image could not be removed from storage")
+	}
 	return data(c, fiber.Map{"ok": true})
 }

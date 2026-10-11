@@ -1,10 +1,12 @@
-.PHONY: run dev migrate test check build fmt
+.PHONY: run dev migrate migrate-assets test check build fmt
 run:
 	go run ./cmd/api
 dev:
 	air
 migrate:
 	go run ./cmd/migrate
+migrate-assets:
+	go run ./cmd/migrate-assets
 test:
 	go test -race ./...
 check:

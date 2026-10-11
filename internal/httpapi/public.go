@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -40,7 +41,7 @@ func RegisterPublicRoutes(router fiber.Router, db Querier) {
 	router.Get("/areas/:city/:areaSlug", api.getArea)
 	router.Get("/blog", api.listBlog)
 	router.Get("/blog/:slug", api.getBlogPost)
-	router.Get("/seo-pages/:slug", api.getSEOPage)
+	router.Get("/seo-pages/*", api.getSEOPage)
 	router.Get("/faqs", api.listFAQs)
 	router.Get("/testimonials", api.listTestimonials)
 	router.Get("/agents", api.listAgents)
@@ -167,7 +168,7 @@ func (api *publicAPI) listProperties(c *fiber.Ctx) error {
 	requireOneOf(fields, "purpose", purpose, "sale", "rent")
 	requireOneOf(fields, "type", c.Query("type"), "House", "Plot", "Apartment", "Commercial", "Farm House")
 	sort := c.Query("sort", "newest")
-	requireOneOf(fields, "sort", sort, "newest", "price", "-price")
+	requireOneOf(fields, "sort", sort, "newest", "price", "-price", "featured")
 	if len(fields) > 0 {
 		return failFields(c, 400, "VALIDATION_ERROR", "Invalid property filters", fields)
 	}
@@ -182,6 +183,9 @@ func (api *publicAPI) listProperties(c *fiber.Ctx) error {
 	}
 	if sort == "-price" {
 		order = "price desc"
+	}
+	if sort == "featured" {
+		order = "home_sort_order asc, id asc"
 	}
 	args = append(args, perPage, offset)
 	rows, err := api.db.Query(c.UserContext(), propertyListSelect(base, order, len(args)-1, len(args)), args...)
@@ -201,6 +205,9 @@ func propertyListSQL(c *fiber.Ctx, purpose string) (string, []any) {
 	add := func(condition string, value any) {
 		args = append(args, value)
 		clauses = append(clauses, fmt.Sprintf(condition, len(args)))
+	}
+	if c.Query("featured") == "true" {
+		clauses = append(clauses, "p.home")
 	}
 	if city := c.Query("city"); city != "" {
 		add("p.city = $%d", city)
@@ -281,6 +288,9 @@ func (api *publicAPI) listProjects(c *fiber.Ctx) error {
 	page, perPage, offset := parsePagination(c, 12)
 	args := []any{}
 	clauses := []string{"p.active"}
+	if c.Query("home") == "true" {
+		clauses = append(clauses, "p.home")
+	}
 	if city := c.Query("city"); city != "" {
 		args = append(args, city)
 		clauses = append(clauses, fmt.Sprintf("p.city = $%d", len(args)))
@@ -384,11 +394,12 @@ select jsonb_build_object(
   'id', a.id::text, 'name', a.name, 'city', a.city::text, 'slug', lower(regexp_replace(a.name, '[^a-zA-Z0-9]+', '-', 'g')),
   'coverImageUrl', a.cover_image_url, 'h1', a.h1, 'metaTitle', a.meta_title, 'metaDesc', a.meta_desc,
   'description', a.description, 'stats', jsonb_build_object('listingCount', coalesce(ast.listing_count, 0)),
+  'indexable', exists (select 1 from seo_pages sp join v_seo_page_status st on st.seo_page_id=sp.id where sp.area_id=a.id and st.display_status='Indexed'),
+  'pages', coalesce((select jsonb_agg(jsonb_build_object('h1',sp.h1,'slug',sp.slug::text) order by sp.id) from seo_pages sp where sp.area_id=a.id and sp.published),'[]'::jsonb),
   'faqs', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'question', question, 'answer', answer, 'sortOrder', sort_order) order by sort_order, id) from faqs where entity_type = 'area' and entity_id = a.id), '[]'::jsonb)
 )
 from areas a left join v_area_stats ast on ast.area_id = a.id
-where a.city = $1 and lower(regexp_replace(a.name, '[^a-zA-Z0-9]+', '-', 'g')) = lower($2)
-  and exists (select 1 from seo_pages sp join v_seo_page_status st on st.seo_page_id = sp.id where sp.area_id = a.id and st.display_status = 'Indexed')`,
+where a.city = $1 and lower(regexp_replace(a.name, '[^a-zA-Z0-9]+', '-', 'g')) = lower($2)`,
 		c.Params("city"), c.Params("areaSlug"))
 	if err != nil {
 		return dbError(c, err)
@@ -446,17 +457,40 @@ where p.status = 'Published' and (p.publish_date is null or p.publish_date <= cu
 }
 
 func (api *publicAPI) getSEOPage(c *fiber.Ctx) error {
+	rawSlug := c.Params("*")
+	if rawSlug == "" {
+		rawSlug = c.Params("slug")
+	}
+	slug, err := url.PathUnescape(rawSlug)
+	if err != nil {
+		return fail(c, 400, "VALIDATION_ERROR", "Invalid SEO page URL")
+	}
+	page, perPage, offset := parsePagination(c, 12)
 	item, err := queryJSON(c.UserContext(), api.db, `
 select jsonb_build_object(
-  'id', sp.id::text, 'slug', sp.slug::text, 'h1', sp.h1, 'metaTitle', replace(sp.meta_title, '{count}', st.matching_listing_count::text),
-  'metaDesc', sp.meta_desc, 'city', sp.city::text, 'areaId', sp.area_id::text, 'type', sp.type::text,
-  'purpose', sp.purpose::text, 'minPrice', sp.min_price::float8, 'maxPrice', sp.max_price::float8,
-  'tags', sp.tags, 'intro', sp.intro, 'content', sp.content, 'displayStatus', st.display_status,
-  'matchingListingCount', st.matching_listing_count,
-  'properties', coalesce((select jsonb_agg(jsonb_build_object('id', p.id::text, 'slug', p.slug::text, 'title', p.title, 'price', p.price::float8, 'type', p.type::text, 'purpose', p.purpose::text) order by coalesce(pin.sort_order, 999999), p.created_at desc) from properties p left join seo_page_pins pin on pin.seo_page_id = sp.id and pin.property_id = p.id where p.status = 'Published' and p.city = sp.city and (sp.area_id is null or p.area_id = sp.area_id) and (sp.type = 'All' or p.type::text = sp.type::text) and p.purpose = sp.purpose and (sp.min_price is null or p.price >= sp.min_price) and (sp.max_price is null or p.price <= sp.max_price)), '[]'::jsonb)
+  'id',sp.id::text,'slug',sp.slug::text,'h1',sp.h1,'metaTitle',replace(sp.meta_title,'{count}',st.matching_listing_count::text),
+  'metaDesc',sp.meta_desc,'city',sp.city::text,'areaId',sp.area_id::text,'type',sp.type::text,'purpose',sp.purpose::text,
+  'minPrice',sp.min_price::float8,'maxPrice',sp.max_price::float8,'tags',sp.tags,'intro',sp.intro,'content',sp.content,
+  'displayStatus',st.display_status,'matchingListingCount',st.matching_listing_count,'page',$4::int,'perPage',$2::int,
+  'faqs',coalesce((select jsonb_agg(jsonb_build_object('question',question,'answer',answer) order by sort_order,id) from faqs where entity_type='seo_page' and entity_id=sp.id),'[]'::jsonb),
+  'properties',coalesce((select jsonb_agg(jsonb_build_object(
+    'id',p.id::text,'slug',p.slug::text,'title',p.title,'city',p.city::text,'area',p.area_name,
+    'price',p.price::float8,'type',p.type::text,'purpose',p.purpose::text,'size',p.size::float8,'unit',p.unit::text,
+    'beds',p.beds,'baths',p.baths,'created_at',p.created_at,'featured',p.home,
+    'img',coalesce((select url from property_media where property_id=p.id order by sort_order,id limit 1),''),
+    'phone',coalesce((select phone from agents where id=p.agent_id),'')
+  ) order by p.pin_order,p.created_at desc,p.id desc) from (
+    select p.*,a.name as area_name,coalesce(pin.sort_order,999999) as pin_order
+    from properties p join areas a on a.id=p.area_id
+    left join seo_page_pins pin on pin.seo_page_id=sp.id and pin.property_id=p.id
+    where p.status='Published' and p.city=sp.city and (sp.area_id is null or p.area_id=sp.area_id)
+      and (sp.type='All' or p.type::text=sp.type::text) and p.purpose=sp.purpose
+      and (sp.min_price is null or p.price>=sp.min_price) and (sp.max_price is null or p.price<=sp.max_price)
+    order by coalesce(pin.sort_order,999999),p.created_at desc,p.id desc limit $2 offset $3
+  ) p),'[]'::jsonb)
 )
-from seo_pages sp join v_seo_page_status st on st.seo_page_id = sp.id
-where sp.slug = $1 and st.display_status = 'Indexed'`, c.Params("slug"))
+from seo_pages sp join v_seo_page_status st on st.seo_page_id=sp.id
+where sp.slug=$1 and sp.published`, slug, perPage, offset, page)
 	if err != nil {
 		return dbError(c, err)
 	}
