@@ -71,6 +71,8 @@ func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
 	protected.Get("/dashboard", api.dashboard)
 	protected.Get("/summary", api.summary)
 	protected.Get("/homepage-sections", api.listHomepageSections)
+	protected.Get("/homepage-hero", api.getHomepageHero)
+	protected.Patch("/homepage-hero", api.atomic((*adminAPI).updateHomepageHero))
 	protected.Patch("/homepage-sections", api.updateHomepageSections)
 	protected.Get("/leads", api.listLeads)
 	protected.Get("/leads/:id", api.getLead)

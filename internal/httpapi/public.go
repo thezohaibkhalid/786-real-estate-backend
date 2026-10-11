@@ -591,6 +591,8 @@ func (api *publicAPI) getSettings(c *fiber.Ctx) error {
 select jsonb_build_object(
   'name', s.name, 'phone', s.phone, 'whatsapp', s.whatsapp, 'email', s.email::text,
   'heroTitle', s.hero_title, 'heroSub', s.hero_sub, 'heroImageUrl', s.hero_image_url,
+  'heroConfig', s.hero_config,
+  'heroAreas', coalesce((select jsonb_agg(jsonb_build_object('id',a.id,'name',a.name,'city',a.city::text) order by a.name) from areas a where a.city::text=s.hero_config->>'city'),'[]'::jsonb),
   'exitIntentEnabled', s.exit_intent_enabled, 'whatsappFloatEnabled', s.whatsapp_float_enabled,
   'currencyRates', coalesce((select jsonb_agg(jsonb_build_object('code', code::text, 'rateToPkr', rate_to_pkr::float8, 'updatedAt', updated_at) order by code) from currency_rates), '[]'::jsonb),
   'homepageSections', coalesce((select jsonb_agg(jsonb_build_object('key', key, 'sortOrder', sort_order) order by sort_order, key) from homepage_sections where is_visible), '[]'::jsonb)
