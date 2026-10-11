@@ -16,7 +16,7 @@ insert into site_settings (
   '786 Real Estate',
   '+923000000000',
   '923000000000',
-  'info@786realestate.example',
+  '786realeestates.com@gmail.com',
   'Verified houses, plots and approved projects in Faisalabad',
   'Trusted property advisors for buyers, renters, sellers and overseas Pakistanis.',
   '',
