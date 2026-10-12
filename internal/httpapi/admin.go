@@ -878,7 +878,7 @@ func (api *adminAPI) deleteUnreferencedMedia(c *fiber.Ctx, urls []string) error 
 				(select count(*) from agents where photo_url=$1) +
 				(select count(*) from blog_posts where cover_image_url=$1) +
 				(select count(*) from testimonials where photo_url=$1) +
-				(select count(*) from site_settings where hero_image_url=$1) +
+				(select count(*) from site_settings where hero_image_url=$1 or to_jsonb(site_settings)->'hero_config'->>'tabletImageUrl'=$1) +
                 (select count(*) from properties where strpos(description,$1)>0) +
                 (select count(*) from projects where strpos(description,$1)>0 or strpos(dev_about,$1)>0) +
                 (select count(*) from areas where strpos(description,$1)>0) +

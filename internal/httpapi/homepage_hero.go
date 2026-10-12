@@ -15,6 +15,7 @@ type heroFilters struct {
 }
 type heroConfig struct {
 	City            string      `json:"city"`
+	TabletImageURL  string      `json:"tabletImageUrl"`
 	Eyebrow         string      `json:"eyebrow"`
 	AreaMode        string      `json:"areaMode"`
 	AreaIDs         []int64     `json:"areaIds"`
@@ -24,7 +25,7 @@ type heroConfig struct {
 }
 
 func validHeroConfig(h heroConfig) bool {
-	if strings.TrimSpace(h.City) == "" || len(h.Eyebrow) > 160 || (h.AreaMode != "all" && h.AreaMode != "selected") || h.ShowAreaChips == nil || h.Filters.Purpose == nil || h.Filters.Area == nil || h.Filters.Type == nil || h.Filters.Budget == nil || h.AreaIDs == nil || h.FeaturedAreaIDs == nil || len(h.FeaturedAreaIDs) > 4 || len(h.AreaIDs) > 200 {
+	if strings.TrimSpace(h.City) == "" || len(h.Eyebrow) > 160 || len(h.TabletImageURL) > 2048 || (h.AreaMode != "all" && h.AreaMode != "selected") || h.ShowAreaChips == nil || h.Filters.Purpose == nil || h.Filters.Area == nil || h.Filters.Type == nil || h.Filters.Budget == nil || h.AreaIDs == nil || h.FeaturedAreaIDs == nil || len(h.FeaturedAreaIDs) > 4 || len(h.AreaIDs) > 200 {
 		return false
 	}
 	ids := map[int64]bool{}
@@ -79,8 +80,8 @@ func (api *adminAPI) updateHomepageHero(c *fiber.Ctx) error {
 	if !valid {
 		return fail(c, 400, "VALIDATION_ERROR", "Choose saved areas in the selected city")
 	}
-	var oldHero string
-	if err := api.db.QueryRow(c.UserContext(), `select hero_image_url from site_settings where id=true for update`).Scan(&oldHero); err != nil {
+	var oldHero, oldTablet string
+	if err := api.db.QueryRow(c.UserContext(), `select hero_image_url,coalesce(hero_config->>'tabletImageUrl','') from site_settings where id=true for update`).Scan(&oldHero, &oldTablet); err != nil {
 		return dbError(c, err)
 	}
 	encoded, _ := json.Marshal(req.Config)
@@ -90,6 +91,11 @@ func (api *adminAPI) updateHomepageHero(c *fiber.Ctx) error {
 	}
 	if oldHero != *req.ImageURL {
 		if err := api.deleteUnreferencedMedia(c, []string{oldHero}); err != nil {
+			return dbError(c, err)
+		}
+	}
+	if oldTablet != req.Config.TabletImageURL {
+		if err := api.deleteUnreferencedMedia(c, []string{oldTablet}); err != nil {
 			return dbError(c, err)
 		}
 	}
