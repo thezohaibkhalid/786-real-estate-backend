@@ -89,10 +89,12 @@ func parseInt64(raw string) (int64, bool) {
 }
 
 func data(c *fiber.Ctx, payload any) error {
+	sanitizeContent(payload)
 	return c.JSON(Response{Data: payload, Meta: fiber.Map{}})
 }
 
 func list(c *fiber.Ctx, payload any, page, perPage, total int) error {
+	sanitizeContent(payload)
 	return c.JSON(Response{
 		Data: payload,
 		Meta: fiber.Map{"pagination": pagination{
@@ -146,6 +148,7 @@ func queryJSON(ctx context.Context, db Querier, sql string, args ...any) (map[st
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
+	sanitizeContent(out)
 	return out, nil
 }
 
@@ -410,7 +413,12 @@ where a.city = $1 and lower(regexp_replace(a.name, '[^a-zA-Z0-9]+', '-', 'g')) =
 func (api *publicAPI) listBlog(c *fiber.Ctx) error {
 	page, perPage, offset := parsePagination(c, 12)
 	args := []any{}
-	clauses := []string{"status = 'Published'", "(publish_date is null or publish_date <= current_date)"}
+	fields := map[string]string{}
+	requireOneOf(fields, "category", c.Query("category"), "Buying Guide", "Society Reviews", "Market Updates", "Commercial", "Legal & Documents", "Overseas")
+	if len(fields) > 0 {
+		return failFields(c, 400, "VALIDATION_ERROR", "Invalid blog filters", fields)
+	}
+	clauses := []string{publicBlogSQL("")}
 	if category := c.Query("category"); category != "" {
 		args = append(args, category)
 		clauses = append(clauses, fmt.Sprintf("category = $%d::blog_category", len(args)))
@@ -446,10 +454,10 @@ select jsonb_build_object(
   'author', case when a.id is null then null else jsonb_build_object('id', a.id::text, 'name', a.name, 'role', a.role, 'photoUrl', a.photo_url) end,
   'sections', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'heading', heading, 'body', body, 'sortOrder', sort_order) order by sort_order, id) from blog_post_sections where post_id = p.id), '[]'::jsonb),
   'faqs', coalesce((select jsonb_agg(jsonb_build_object('id', id::text, 'question', question, 'answer', answer, 'sortOrder', sort_order) order by sort_order, id) from faqs where entity_type = 'blog_post' and entity_id = p.id), '[]'::jsonb),
-  'relatedPosts', coalesce((select jsonb_agg(jsonb_build_object('id', r.id::text, 'slug', r.slug::text, 'title', r.title, 'category', r.category::text, 'excerpt', r.excerpt)) from (select id, slug, title, category, excerpt from blog_posts where status = 'Published' and id <> p.id and (category = p.category or area_id is not distinct from p.area_id) order by publish_date desc nulls last, created_at desc limit 3) r), '[]'::jsonb)
+  'relatedPosts', coalesce((select jsonb_agg(jsonb_build_object('id', r.id::text, 'slug', r.slug::text, 'title', r.title, 'category', r.category::text, 'excerpt', r.excerpt)) from (select id, slug, title, category, excerpt from blog_posts where `+publicBlogSQL("")+` and id <> p.id and (category = p.category or area_id is not distinct from p.area_id) order by publish_date desc nulls last, created_at desc limit 3) r), '[]'::jsonb)
 )
 from blog_posts p left join agents a on a.id = p.author_id
-where p.status = 'Published' and (p.publish_date is null or p.publish_date <= current_date) and p.slug = $1`, c.Params("slug"))
+where `+publicBlogSQL("p")+` and p.slug = $1`, c.Params("slug"))
 	if err != nil {
 		return dbError(c, err)
 	}
@@ -608,9 +616,11 @@ func (api *publicAPI) getSitemap(c *fiber.Ctx) error {
 	rows, err := api.db.Query(c.UserContext(), `
 select '/properties/' || slug::text as url, updated_at as last_modified from properties where status = 'Published'
 union all select '/projects/' || slug::text, updated_at from projects where active
-union all select '/blog/' || slug::text, updated_at from blog_posts where status = 'Published' and (publish_date is null or publish_date <= current_date)
+union all select '/blog/' || slug::text, updated_at from blog_posts where `+publicBlogSQL("")+`
 union all select '/cities/' || lower(regexp_replace(name::text, '[^a-zA-Z0-9]+', '-', 'g')), null::timestamptz from cities
 union all select '/legal/' || key::text, last_updated_at from legal_documents
+union all select '/' || sp.slug::text, sp.updated_at from seo_pages sp join v_seo_page_status st on st.seo_page_id=sp.id where st.display_status='Indexed'
+union all select '/' || lower(regexp_replace(a.city::text,'[^a-zA-Z0-9]+','-','g')) || '/' || lower(regexp_replace(a.name,'[^a-zA-Z0-9]+','-','g')), a.updated_at from areas a where exists (select 1 from seo_pages sp join v_seo_page_status st on st.seo_page_id=sp.id where sp.area_id=a.id and st.display_status='Indexed')
 order by url`)
 	if err != nil {
 		return dbError(c, err)
@@ -672,6 +682,9 @@ func validateLead(req leadRequest) map[string]string {
 	}
 	if !validPhone(req.Phone) {
 		fields["phone"] = "must be a Pakistan mobile number or international phone number"
+	}
+	if req.Form == "" {
+		fields["form"] = "required"
 	}
 	requireOneOf(fields, "form", req.Form,
 		"Property Inquiry", "Project Inquiry", "Contact Form", "Requirement Form",
@@ -739,8 +752,15 @@ select id::text from alert`,
 var phoneRE = regexp.MustCompile(`^(\+?[1-9][0-9]{7,14}|03[0-9]{9})$`)
 
 func validPhone(phone string) bool {
-	phone = strings.ReplaceAll(strings.TrimSpace(phone), " ", "")
-	phone = strings.ReplaceAll(phone, "-", "")
+	phone = strings.Map(func(r rune) rune {
+		if r == ' ' || r == '-' || r == '(' || r == ')' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(phone))
+	if strings.HasPrefix(phone, "00") {
+		phone = "+" + phone[2:]
+	}
 	return phoneRE.MatchString(phone)
 }
 

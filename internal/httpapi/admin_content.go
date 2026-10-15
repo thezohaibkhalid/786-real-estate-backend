@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -49,6 +50,14 @@ func validateAdminBlogPost(req adminBlogPostPayload) map[string]string {
 	}
 	if req.Status != "Draft" && req.Status != "Published" && req.Status != "Scheduled" {
 		fields["status"] = "invalid"
+	}
+	if req.Status == "Scheduled" && strings.TrimSpace(req.PublishDate) == "" {
+		fields["publishDate"] = "required for scheduled articles"
+	}
+	if req.PublishDate != "" {
+		if _, err := time.Parse("2006-01-02", req.PublishDate); err != nil {
+			fields["publishDate"] = "must be a valid date"
+		}
 	}
 	return fields
 }

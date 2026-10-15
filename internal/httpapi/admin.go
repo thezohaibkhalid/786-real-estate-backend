@@ -22,6 +22,7 @@ import (
 	"example.com/786-real-estate/backend/internal/config"
 	"example.com/786-real-estate/backend/internal/storage"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/argon2"
@@ -59,9 +60,16 @@ func RegisterAdminRoutes(router fiber.Router, cfg config.Config, db Querier) {
 	}
 	api := &adminAPI{db: db, cfg: cfg, r2: r2}
 	router.Use(api.checkAdminOrigin)
-	router.Post("/auth/login", api.login)
-	router.Post("/auth/forgot-password", api.forgotPassword)
-	router.Post("/auth/reset-password", api.resetPassword)
+	authThrottle := limiter.New(limiter.Config{
+		Max: 20, Expiration: 15 * time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string { return c.Path() + ":" + clientIP(c) },
+		LimitReached: func(c *fiber.Ctx) error {
+			return fail(c, 429, "RATE_LIMITED", "Too many authentication attempts. Try again later.")
+		},
+	})
+	router.Post("/auth/login", authThrottle, api.login)
+	router.Post("/auth/forgot-password", authThrottle, api.forgotPassword)
+	router.Post("/auth/reset-password", authThrottle, api.resetPassword)
 	router.Post("/auth/logout", api.logout)
 
 	protected := router.Group("")
