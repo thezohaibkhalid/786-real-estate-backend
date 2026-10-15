@@ -1,12 +1,6 @@
 module example.com/786-real-estate/backend
 
-go 1.26.0
-
-require (
-	github.com/gofiber/fiber/v2 v2.52.15
-	github.com/jackc/pgx/v5 v5.11.0
-	golang.org/x/text v0.42.0 // indirect
-)
+go 1.27.2
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3
@@ -15,7 +9,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3
 	github.com/disintegration/imaging v1.6.2
 	github.com/gen2brain/webp v0.6.4
+	github.com/gofiber/fiber/v2 v2.52.15
 	github.com/google/uuid v1.6.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
 	github.com/microcosm-cc/bluemonday v1.0.27
 	golang.org/x/crypto v0.57.0
@@ -54,7 +50,8 @@ require (
 	github.com/valyala/fasthttp v1.51.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
 	golang.org/x/image v0.44.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )

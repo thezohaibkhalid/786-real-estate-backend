@@ -14,12 +14,18 @@ import (
 	"example.com/786-real-estate/backend/internal/config"
 	"github.com/gen2brain/webp"
 	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 )
 
 // Opt in explicitly. This writes a uniquely named test object and removes it.
 func TestLiveR2WebPUpload(t *testing.T) {
 	if os.Getenv("TEST_R2_UPLOAD") != "1" {
 		t.Skip("set TEST_R2_UPLOAD=1 with R2 environment variables for a live upload test")
+	}
+	// `go test` runs from this package, not the backend root used by the API.
+	// Explicit environment variables continue to take precedence.
+	if err := godotenv.Load("../../.env"); err != nil && !os.IsNotExist(err) {
+		t.Fatal("test configuration unavailable")
 	}
 	cfg, err := config.Load()
 	if err != nil {

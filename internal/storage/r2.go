@@ -42,6 +42,9 @@ func NewR2(cfg config.Config) (*R2, error) {
 	return &R2{
 		client: s3.NewFromConfig(awsCfg, func(options *s3.Options) {
 			options.BaseEndpoint = aws.String(endpoint)
+			// R2 uses the account endpoint with the bucket in the URL path.
+			// Virtual-host addressing can produce an unresolvable bucket host.
+			options.UsePathStyle = true
 			options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		}),
 		bucket:     cfg.R2Bucket,
