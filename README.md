@@ -1,6 +1,6 @@
 # 786 Real Estate backend
 
-Go Fiber v2 + PostgreSQL foundation for the existing public Next.js website and admin panel. Fiber v2.52.15 and pgx v5.11.0 are pinned to the locally available versions; this starter does not claim to use Fiber v3. Go 1.26+ required. The module path is a placeholder: replace `example.com/786-real-estate/backend` and its imports when the repository URL is decided.
+Go Fiber v2 + PostgreSQL foundation for the existing public Next.js website and admin panel. Fiber v2.52.15 and pgx v5.11.0 are pinned to the locally available versions; this starter does not claim to use Fiber v3. Go 1.27.2 or newer is required (the module and Docker image pin 1.27.2). The module path is a placeholder: replace `example.com/786-real-estate/backend` and its imports when the repository URL is decided.
 
 ## Local start
 
@@ -47,7 +47,7 @@ Add domain packages under `internal` as endpoints are implemented. Handlers shou
 
 `0001_initial.sql` is copied from the project's existing schema, with only its top-level BEGIN/COMMIT removed so the runner owns the transaction (including views). It is intended for an EMPTY database. Do not apply it to an existing manually-created schema. Existing databases need an explicit baseline reconciliation first. Applied migrations must never be edited; add numbered SQL files instead. Rollbacks require a reviewed forward correction or restoring a backup; there is no destructive down command.
 
-Known original schema/API inconsistencies remain deliberate follow-up work: city/area consistency, persisted area slug/publication support, SEO tags, scheduled publishing, project archival and currency code route keys. The public area endpoint currently derives the slug from `areas.name` and only serves areas that have at least one indexed SEO page. Baseline public content and the development owner account are seeded by migration.
+Known original schema/API inconsistencies remain deliberate follow-up work: city/area consistency, persisted area slug/publication support, editorial SEO tags, project archival and currency code route keys. The public area endpoint currently derives the slug from `areas.name` and only serves areas that have at least one indexed SEO page. Baseline public content and the development owner account are seeded by migration.
 
 ## Validation
 
@@ -57,9 +57,9 @@ make test
 make build
 ```
 
-HTTP tests run without PostgreSQL using a health dependency fake. A real PostgreSQL migration and readiness smoke test should also be run before deployment. Docker builds are optional.
+Contract tests run without PostgreSQL using a health dependency fake. Set `TEST_DATABASE_URL` to run the authenticated CRUD, scheduling, session, homepage and persistence suites against temporary tables and views on private connections. Run a fresh-database migration and readiness smoke test before deployment. Docker builds are optional.
 
-Public CORS permits anonymous requests. Admin CORS permits only ADMIN_ORIGIN plus the equivalent localhost/127.0.0.1 development origin, with credentials; CORS is not authorization. Admin mutations also validate browser Origin headers. Forgot-password emails use `EMAIL_SERVER_*` SMTP settings and store only hashed reset tokens. Before production, replace the seeded password, use production SMTP credentials, add login throttling, and replace the in-process public write limiter with a distributed limiter before running multiple API instances. Logs omit bodies, URLs/query strings and database credentials.
+Public CORS permits anonymous requests. Admin CORS permits only ADMIN_ORIGIN plus the equivalent localhost/127.0.0.1 development origin, with credentials; CORS is not authorization. Admin mutations also validate browser Origin headers. Forgot-password emails use `EMAIL_SERVER_*` SMTP settings and store only hashed reset tokens. Before production, replace the seeded password, use production SMTP credentials, replace the in-process auth and public-write limiters with distributed limits before running multiple API instances. Login, forgot-password and reset-password are limited to 20 attempts per 15 minutes per endpoint and client IP. Logs omit bodies, URLs/query strings and database credentials.
 
 ## Persistent sessions and owner setup
 
@@ -91,3 +91,11 @@ The authenticated `/api/admin/upload` endpoint accepts JPEG, PNG, GIF, WebP and 
 Two image-processing workers bound memory use. The Docker runtime includes libwebp for faster encoding; the Go encoder also supports the existing CGO-free build. These rules apply to uploads through the application and asset importer. Previously stored objects are not automatically rewritten.
 
 `TEST_DATABASE_URL=... go test ./internal/httpapi -run TestAdminPersistenceRoundTrips` verifies FAQ/coverage/office round trips, live counts, lead patches and rollback using temporary tables on a private connection. Existing content is untouched. `TEST_R2_UPLOAD=1 go test ./internal/storage -run TestLiveR2WebPUpload -v` explicitly opts into a real R2 upload/format/size check and removes the uniquely named test object afterward; supply normal R2 environment variables to run it.
+
+## Content and audit checks
+
+Published blog posts with a future publication date stay hidden; scheduled posts become public when their date is due according to the database date. Drafts stay hidden from public lists, detail routes, related posts and the sitemap. Scheduled posts require a valid YYYY-MM-DD date. Rich content is sanitized with the same server-side policy on writes and reads; normal headings, lists, links and images are retained.
+
+For the full isolated regression run: `TEST_DATABASE_URL=... go test -race -count=1 ./...`. Storage image tests can take a few minutes. The optional live R2 upload test loads local `.env` defaults and deletes its uniquely named test object. R2 uses the account endpoint with path-style bucket addressing.
+
+Budget `DB_MAX_CONNS` across every API instance, migration process and test connection. A hosted Supabase session pool with a 15-connection limit was exhausted by the local API plus audit suites with the default pool of 10; the local audit API used 5 connections. Use the appropriate limit for the deployed database rather than increasing it blindly.

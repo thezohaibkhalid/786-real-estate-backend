@@ -55,6 +55,12 @@ func TestInquiryValidation(t *testing.T) {
 			t.Errorf("invalid scheduled date accepted: %q", date)
 		}
 	}
+	var project adminProjectPayload
+	_ = json.Unmarshal([]byte(`{"name":"Test","slug":"test","city":"Faisalabad","areaId":1,"status":"Launching","progressDate":"August 2026","paymentStages":[{"label":"Booking","pct":20,"count":1}]}`), &project)
+	fields := validateAdminProject(project)
+	if fields["progressDate"] == "" || fields["paymentStages"] == "" {
+		t.Fatal("invalid project dates and incomplete payment totals must be rejected")
+	}
 }
 
 // Exercise the real authenticated routes against private temporary tables and

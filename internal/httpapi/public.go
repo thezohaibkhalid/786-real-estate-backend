@@ -109,8 +109,15 @@ func dbError(c *fiber.Ctx, err error) error {
 		return fail(c, 404, "NOT_FOUND", "Resource not found")
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return fail(c, 409, "CONFLICT", "A record with this unique value already exists")
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505":
+			return fail(c, 409, "CONFLICT", "A record with this unique value already exists")
+		case "23503":
+			return fail(c, 409, "CONFLICT", "A related record is missing or is still in use")
+		case "23502", "23514", "22P02", "22007", "22008", "22003":
+			return fail(c, 400, "VALIDATION_ERROR", "A field contains an invalid or missing value")
+		}
 	}
 	return fail(c, 500, "INTERNAL", "An internal error occurred")
 }

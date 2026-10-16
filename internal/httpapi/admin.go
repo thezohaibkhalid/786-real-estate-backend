@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"mime"
 	"net/smtp"
 	"path/filepath"
@@ -1176,6 +1177,23 @@ func validateAdminProject(req adminProjectPayload) map[string]string {
 	requireOneOf(fields, "status", req.Status, "Launching", "Under Construction", "Ready to Move")
 	if req.FromPrice < 0 {
 		fields["fromPrice"] = "must be zero or greater"
+	}
+	if req.ProgressDate != "" {
+		if _, err := time.Parse("2006-01-02", req.ProgressDate); err != nil {
+			fields["progressDate"] = "must be a valid date"
+		}
+	}
+	if len(req.PaymentStages) > 0 {
+		total := 0.0
+		for _, stage := range req.PaymentStages {
+			if stage.Pct < 0 || stage.Pct > 100 {
+				fields["paymentStages"] = "each share must be between 0 and 100"
+			}
+			total += stage.Pct
+		}
+		if math.Abs(total-100) > 0.01 {
+			fields["paymentStages"] = "payment shares must total 100%"
+		}
 	}
 	return fields
 }
