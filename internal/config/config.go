@@ -19,6 +19,7 @@ type Config struct {
 	EmailServerPort                                                          int
 	EmailServerSecure                                                        bool
 	MaxConns                                                                 int32
+	TrustedProxies                                                           []string
 }
 
 func Load() (Config, error) {
@@ -79,6 +80,18 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("DB_MAX_CONNS must be between 1 and 100")
 	}
 	c.MaxConns = int32(n)
+	for _, value := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
+		proxy := strings.TrimSpace(value)
+		if proxy == "" {
+			continue
+		}
+		if net.ParseIP(proxy) == nil {
+			if _, _, err := net.ParseCIDR(proxy); err != nil {
+				return c, fmt.Errorf("TRUSTED_PROXIES must contain IP addresses or CIDR networks")
+			}
+		}
+		c.TrustedProxies = append(c.TrustedProxies, proxy)
+	}
 	return c, nil
 }
 func value(key, fallback string) string {

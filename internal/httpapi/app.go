@@ -41,6 +41,8 @@ func failFields(c *fiber.Ctx, status int, code, message string, fields map[strin
 func New(cfg config.Config, db Pinger, log *slog.Logger) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName: "786 Real Estate API", DisableStartupMessage: true,
+		ProxyHeader: "X-Real-IP", EnableTrustedProxyCheck: true,
+		TrustedProxies: cfg.TrustedProxies, EnableIPValidation: true,
 		BodyLimit: 26 << 20, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			status, code, message := 500, "INTERNAL", "An internal error occurred"

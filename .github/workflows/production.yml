@@ -1,0 +1,81 @@
+name: Check and deploy production
+on:
+  push:
+    branches: [main, production]
+  pull_request:
+    branches: [main, production]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: production-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: realestate
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: realestate_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U realestate -d realestate_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      APP_ENV: test
+      DATABASE_URL: postgres://realestate:ci-only-password@localhost:5432/realestate_test?sslmode=disable
+      TEST_DATABASE_URL: postgres://realestate:ci-only-password@localhost:5432/realestate_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal migrations)"
+      - run: go vet ./...
+      - name: Apply schema to the disposable CI database
+        run: go run ./cmd/migrate
+      - name: Run unit, persistence and race tests
+        run: go test -race -count=1 ./...
+      - run: go build ./cmd/api ./cmd/migrate
+  deploy:
+    if: github.ref == 'refs/heads/production' && github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build immutable production image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: 786/backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Deploy over pinned SSH connection
+        env:
+          DEPLOY_HOST: ${{ secrets.PRODUCTION_HOST }}
+          DEPLOY_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.PRODUCTION_SSH_HOST_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] || { echo "Missing or invalid PRODUCTION_HOST" >&2; exit 1; }
+          [[ -n "$DEPLOY_KEY" && -n "$DEPLOY_HOST_KEY" ]] || { echo "Missing deployment SSH secrets" >&2; exit 1; }
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/786-deploy"
+          printf '%s\n' "$DEPLOY_HOST_KEY" > "$HOME/.ssh/known_hosts"
+          trap 'rm -f "$HOME/.ssh/786-deploy"' EXIT
+          docker save "786/backend:${GITHUB_SHA}" | gzip -1 | ssh -T \
+            -i "$HOME/.ssh/786-deploy" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+            "deploy786@${DEPLOY_HOST}" "$GITHUB_SHA"

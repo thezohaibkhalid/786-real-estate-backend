@@ -1,6 +1,9 @@
 .git
-.env
-.env.*
-bin
-coverage.out
+.github
+.env*
 !.env.example
+bin
+tmp
+coverage.out
+*.key
+*.pem

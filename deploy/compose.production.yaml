@@ -1,0 +1,72 @@
+name: realestate786
+x-common: &common
+  restart: unless-stopped
+  init: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 160
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+services:
+  backend:
+    <<: *common
+    image: ${BACKEND_IMAGE:-786/backend:unconfigured}
+    env_file:
+      - path: /opt/786/env/backend.env
+        format: raw
+    ports: ["127.0.0.1:8080:8080"]
+    mem_limit: 320m
+    memswap_limit: 640m
+    environment:
+      GOMEMLIMIT: 192MiB
+      GOMAXPROCS: "2"
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/health/ready]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+  frontend:
+    <<: *common
+    image: ${FRONTEND_IMAGE:-786/frontend:unconfigured}
+    env_file:
+      - path: /opt/786/env/frontend.env
+        format: raw
+    ports: ["127.0.0.1:3000:3000"]
+    mem_limit: 384m
+    memswap_limit: 768m
+    environment:
+      NODE_OPTIONS: --max-old-space-size=224
+      MALLOC_ARENA_MAX: "2"
+    volumes: [frontend_cache:/app/.next/cache]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+  admin:
+    <<: *common
+    image: ${ADMIN_IMAGE:-786/admin:unconfigured}
+    env_file:
+      - path: /opt/786/env/admin.env
+        format: raw
+    ports: ["127.0.0.1:3001:3000"]
+    mem_limit: 256m
+    memswap_limit: 512m
+    environment:
+      NODE_OPTIONS: --max-old-space-size=160
+      MALLOC_ARENA_MAX: "2"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+volumes:
+  frontend_cache:
+networks:
+  default:
+    name: realestate786_default
+    external: true
