@@ -5,6 +5,8 @@ import (
 	"example.com/786-real-estate/backend/internal/config"
 	"example.com/786-real-estate/backend/internal/database"
 	"example.com/786-real-estate/backend/internal/httpapi"
+	"example.com/786-real-estate/backend/internal/storage"
+	"github.com/gen2brain/webp"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -20,8 +22,14 @@ func main() {
 	}
 }
 func run(log *slog.Logger) error {
+	if len(os.Args) == 2 && os.Args[1] == "--check-image-encoder" {
+		return webp.Dynamic()
+	}
 	cfg, err := config.Load()
 	if err != nil {
+		return err
+	}
+	if err := storage.ConfigureImageWorkers(cfg.ImageWorkers); err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

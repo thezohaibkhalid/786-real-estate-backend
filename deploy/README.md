@@ -17,7 +17,7 @@ The workflow streams the compressed image over SSH to a forced-command deploymen
 
 The VM serializes releases using `flock`, loads the image, runs transactional backend migrations before replacing the API, and checks container health plus an HTTP smoke request. A failed application health check restores the preceding image when available. Database migrations are forward-only: image rollback does not reverse schema changes, so migrations must remain compatible with the preceding application release.
 
-Only Nginx binds publicly to ports 80/443. Application ports 3000, 3001 and 8080 bind to loopback. Containers run as non-root, drop Linux capabilities, restart after reboot, have memory/process limits, and rotate logs. A 4 GiB swap file accommodates memory spikes; sustained traffic and concurrent large image uploads still require monitoring on this 1 GiB VM.
+Only Nginx binds publicly to ports 80/443. Application ports 3000, 3001 and 8080 bind to loopback. Containers run as non-root, drop Linux capabilities, restart after reboot, have memory/process limits, and rotate logs. The runtime verifies that the native WebP encoder loads, and `IMAGE_WORKERS=1` serializes image optimization on this small VM. A 4 GiB swap file accommodates memory spikes; sustained traffic and concurrent large image uploads still require monitoring on this 1 GiB VM.
 
 ## GitHub configuration
 

@@ -25,6 +25,15 @@ const (
 var ErrInvalidImage = errors.New("invalid image")
 var imageWorkers = make(chan struct{}, 2)
 
+// ConfigureImageWorkers is called once at startup, before serving requests.
+func ConfigureImageWorkers(count int) error {
+	if count < 1 || count > 2 {
+		return errors.New("IMAGE_WORKERS must be 1 or 2")
+	}
+	imageWorkers = make(chan struct{}, count)
+	return nil
+}
+
 // OptimizeImage decodes actual image bytes, applies camera orientation, resizes
 // without upscaling and strips metadata by encoding fresh WebP pixels. Animated
 // GIF/WebP uploads use their first frame, as listing galleries contain stills.

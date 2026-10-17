@@ -7,6 +7,16 @@ case "$service" in frontend|admin|backend) ;; *) exit 64 ;; esac
 [[ -f "$archive" && ! -L "$archive" ]] || exit 64
 [[ "$(realpath "$archive")" == /var/lib/786-deploy/incoming/"$service-$sha".*.tar.gz ]] || exit 64
 exec 9>/run/lock/786-deploy.lock
+# Wait outside the release lock so a first backend deployment can finish while
+# the frontend/admin pipelines arrive in parallel.
+if [[ "$service" != backend ]]; then
+  ready=false
+  for attempt in $(seq 1 150); do
+    if curl --fail --silent --max-time 3 http://127.0.0.1:8080/health/ready >/dev/null; then ready=true; break; fi
+    sleep 2
+  done
+  [[ "$ready" == true ]] || { echo 'Backend readiness prerequisite failed' >&2; exit 1; }
+fi
 flock -w 900 9
 cd /opt/786
 python3 deploy/configure.py

@@ -20,6 +20,7 @@ type Config struct {
 	EmailServerSecure                                                        bool
 	MaxConns                                                                 int32
 	TrustedProxies                                                           []string
+	ImageWorkers                                                             int
 }
 
 func Load() (Config, error) {
@@ -80,6 +81,10 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("DB_MAX_CONNS must be between 1 and 100")
 	}
 	c.MaxConns = int32(n)
+	c.ImageWorkers, err = strconv.Atoi(value("IMAGE_WORKERS", "2"))
+	if err != nil || c.ImageWorkers < 1 || c.ImageWorkers > 2 {
+		return c, fmt.Errorf("IMAGE_WORKERS must be 1 or 2")
+	}
 	for _, value := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
 		proxy := strings.TrimSpace(value)
 		if proxy == "" {

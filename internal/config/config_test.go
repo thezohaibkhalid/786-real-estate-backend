@@ -8,11 +8,12 @@ func TestConfigValidation(t *testing.T) {
 	t.Setenv("HTTP_ADDR", "127.0.0.1:8080")
 	t.Setenv("ADMIN_ORIGIN", "http://localhost:3001")
 	t.Setenv("DB_MAX_CONNS", "10")
+	t.Setenv("IMAGE_WORKERS", "1")
 	if _, err := Load(); err != nil {
 		t.Fatal(err)
 	}
 	for _, tt := range []struct{ key, value string }{
-		{"DATABASE_URL", ""}, {"DB_MAX_CONNS", "0"}, {"DB_MAX_CONNS", "bad"}, {"ADMIN_ORIGIN", "*"}, {"ADMIN_ORIGIN", "http://localhost:3001/path"}, {"APP_ENV", "unknown"}, {"HTTP_ADDR", "bad"},
+		{"DATABASE_URL", ""}, {"DB_MAX_CONNS", "0"}, {"DB_MAX_CONNS", "bad"}, {"IMAGE_WORKERS", "0"}, {"IMAGE_WORKERS", "3"}, {"ADMIN_ORIGIN", "*"}, {"ADMIN_ORIGIN", "http://localhost:3001/path"}, {"APP_ENV", "unknown"}, {"HTTP_ADDR", "bad"},
 	} {
 		t.Run(tt.key+tt.value, func(t *testing.T) {
 			t.Setenv(tt.key, tt.value)

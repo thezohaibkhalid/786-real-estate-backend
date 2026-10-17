@@ -59,12 +59,12 @@ def render(root, nginx_output=None, cert_root=Path('/etc/letsencrypt/live/786-re
     env_dir.mkdir(mode=0o700, exist_ok=True)
     backend = {key: value for key, value in values.items()
                if key.startswith(('EMAIL_', 'R2_')) or key in
-               ['DATABASE_URL', 'SESSION_SECRET', 'DB_MAX_CONNS', 'TRUSTED_PROXIES']}
+               ['DATABASE_URL', 'SESSION_SECRET', 'DB_MAX_CONNS', 'TRUSTED_PROXIES', 'IMAGE_WORKERS']}
     backend.update(APP_ENV='production', HTTP_ADDR='0.0.0.0:8080', ADMIN_ORIGIN=admin)
     frontend = {'NODE_ENV': 'production', 'SITE_URL': public,
                 'API_INTERNAL_BASE_URL': values.get('API_INTERNAL_BASE_URL', 'http://backend:8080/api'),
                 'REVALIDATE_SECRET': values['REVALIDATE_SECRET']}
-    admin_env = {'NODE_ENV': 'production', 'PUBLIC_SITE_URL': public,
+    admin_env = {'NODE_ENV': 'production', 'PUBLIC_SITE_URL': public, 'ADMIN_SITE_URL': admin,
                  'ADMIN_API_PROXY_URL': values.get('ADMIN_API_PROXY_URL', 'http://backend:8080/api/admin'),
                  'PUBLIC_SITE_INTERNAL_URL': values.get('PUBLIC_SITE_INTERNAL_URL', 'http://frontend:3000'),
                  'REVALIDATE_SECRET': values['REVALIDATE_SECRET']}
