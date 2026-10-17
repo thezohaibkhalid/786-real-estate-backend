@@ -5,7 +5,7 @@ service=${1:?Missing service}; sha=${2:?Missing commit SHA}; archive=${3:?Missin
 case "$service" in frontend|admin|backend) ;; *) exit 64 ;; esac
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 64
 [[ -f "$archive" && ! -L "$archive" ]] || exit 64
-[[ "$(realpath "$archive")" == /var/lib/786-deploy/incoming/"$service-$sha".*.tar.gz ]] || exit 64
+[[ "$(realpath "$archive")" == /var/lib/786-deploy/incoming/"$service-$sha".*.json ]] || exit 64
 exec 9>/run/lock/786-deploy.lock
 # Wait outside the release lock so a first backend deployment can finish while
 # the frontend/admin pipelines arrive in parallel.
@@ -21,7 +21,7 @@ flock -w 900 9
 cd /opt/786
 python3 deploy/configure.py
 compose=(docker compose --env-file state/images.env -f deploy/compose.production.yaml)
-image="786/$service:$sha"
+image="ghcr.io/thezohaibkhalid/786-real-estate-$service:$sha"
 variable="$(printf '%s' "$service" | tr '[:lower:]' '[:upper:]')_IMAGE"
 previous=$(sed -n "s/^${variable}=//p" state/images.env)
 set_image() {
@@ -37,7 +37,12 @@ os.chmod(tmp,0o600)
 os.replace(tmp,path)
 PY
 }
-gzip -dc "$archive" | docker image load
+# Credentials expire with this Actions job and are removed after the pull.
+registry_config=$(mktemp -d /run/786-registry.XXXXXX)
+trap 'rm -rf -- "$registry_config"' EXIT
+registry_user=$(python3 -c 'import json,sys,re; user=json.load(open(sys.argv[1]))["username"]; assert re.fullmatch(r"[A-Za-z0-9_-]+(?:\[bot\])?",user); print(user)' "$archive")
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$archive" | docker --config "$registry_config" login ghcr.io -u "$registry_user" --password-stdin >/dev/null
+docker --config "$registry_config" pull "$image"
 docker image inspect "$image" >/dev/null
 # Migrations are transactional and checksum-checked. A failed migration stops
 # before replacing the old backend. Database changes require forward fixes.
@@ -70,7 +75,7 @@ fi
 printf '%s %s %s\n' "$(date -u +%FT%TZ)" "$service" "$image" >> state/deployments.log
 printf 'Deployed %s at %s\n' "$service" "$sha"
 # Keep the current and immediately previous image for each service.
-for candidate in $(docker image ls "786/$service" --format '{{.Repository}}:{{.Tag}}'); do
+for candidate in $(docker image ls "ghcr.io/thezohaibkhalid/786-real-estate-$service" --format '{{.Repository}}:{{.Tag}}'); do
   if [[ "$candidate" != "$image" && "$candidate" != "$previous" ]]; then
     docker image rm "$candidate" >/dev/null 2>&1 || true
   fi

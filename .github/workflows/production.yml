@@ -47,6 +47,9 @@ jobs:
         run: go test -race -count=1 ./...
       - run: go build ./cmd/api ./cmd/migrate
   deploy:
+    permissions:
+      contents: read
+      packages: write
     if: github.ref == 'refs/heads/production' && github.event_name != 'pull_request'
     needs: validate
     runs-on: ubuntu-24.04
@@ -54,17 +57,25 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Authenticate to GitHub Container Registry
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
       - name: Build immutable production image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          load: true
+          push: true
           platforms: linux/amd64
-          tags: 786/backend:${{ github.sha }}
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Deploy over pinned SSH connection
         env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_HOST: ${{ secrets.PRODUCTION_HOST }}
           DEPLOY_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
           DEPLOY_HOST_KEY: ${{ secrets.PRODUCTION_SSH_HOST_KEY }}
@@ -78,7 +89,7 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/786-deploy"
           printf '%s\n' "$DEPLOY_HOST_KEY" > "$HOME/.ssh/known_hosts"
           trap 'rm -f "$HOME/.ssh/786-deploy"' EXIT
-          docker save "786/backend:${GITHUB_SHA}" | gzip -1 | ssh -T \
+          python3 -c 'import json,os; print(json.dumps({"username":os.environ["REGISTRY_USER"],"token":os.environ["REGISTRY_TOKEN"]}))' | ssh -T \
             -i "$HOME/.ssh/786-deploy" -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
             "deploy786@${DEPLOY_HOST}" "$GITHUB_SHA"
