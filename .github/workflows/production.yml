@@ -37,6 +37,7 @@ jobs:
           cache: true
       - name: Check formatting
         run: test -z "$(gofmt -l cmd internal migrations)"
+      - run: python3 -m unittest discover -s deploy -p 'test_*.py'
       - run: go vet ./...
       - name: Apply schema to the disposable CI database
         run: go run ./cmd/migrate

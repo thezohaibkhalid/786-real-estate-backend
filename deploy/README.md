@@ -27,9 +27,9 @@ Each repo requires encrypted Actions secrets:
 - `PRODUCTION_SSH_KEY`: that service's dedicated Actions-to-VM private key.
 - `PRODUCTION_SSH_HOST_KEY`: a known_hosts line for the VM's trusted Ed25519 host key.
 
-Admin also requires repository variable `PUBLIC_SITE_URL`, currently `https://786.zohaibkhalid.me`. It is compiled into the public “View Site” link. Do not put runtime database, R2, SMTP or cache-refresh credentials in Actions variables or Docker build arguments.
+No application URLs or credentials are compiled into images or stored in GitHub variables. The admin “View Site” route reads `PUBLIC_SITE_URL` at runtime. Do not put database, R2, SMTP or cache-refresh credentials in Actions variables or Docker build arguments.
 
-Runtime secrets exist only in root-owned `/opt/786/env/{backend,frontend,admin}.env`, mode 600. Compose uses raw env-file parsing so `$` in credentials is preserved. `.dockerignore` excludes local secrets and SSH keys from build contexts. The Docker bridge gateway is the API's only `TRUSTED_PROXIES` entry; Nginx overwrites `X-Real-IP`. Cloudflare source ranges may be trusted by Nginx for the client-IP header, while arbitrary incoming forwarding headers remain untrusted.
+The production source of truth is root-owned `/opt/786/.env`, mode 600. `deploy/configure.py` generates `/opt/786/env/{backend,frontend,admin}.env`, also mode 600, with only the values each app needs. Never edit generated files. After changing `.env`, run `sudo /opt/786/deploy/apply-env.sh`; this regenerates Nginx and app configuration and recreates deployed containers as needed. Compose uses raw env-file parsing so `$` in credentials is preserved. `.dockerignore` excludes local secrets and SSH keys from build contexts. The Docker bridge gateway is the API's only `TRUSTED_PROXIES` entry; Nginx overwrites `X-Real-IP`. Cloudflare source ranges may be trusted by Nginx for the client-IP header, while arbitrary incoming forwarding headers remain untrusted.
 
 ## Provisioning and installed files
 
@@ -39,9 +39,9 @@ Run `sudo bash deploy/bootstrap.sh` once on a fresh Ubuntu 24.04 amd64 server. I
 - `deploy.sh` at `/usr/local/sbin/786-deploy`, mode 755.
 - `receive-deploy.sh` at `/usr/local/lib/786/receive-deploy`, mode 755.
 - `nginx-proxy.conf` at `/etc/nginx/snippets/786-proxy.conf`.
-- `nginx.conf` at `/etc/nginx/sites-available/786-real-estate`, symlinked into sites-enabled.
+- The Nginx template `nginx.conf`, `configure.py`, `apply-env.sh` and `enable-https.sh` under `/opt/786/deploy/`. The renderer creates `/etc/nginx/sites-available/786-real-estate`, symlinked into sites-enabled.
 
-Populate runtime env files before deployment. Use the existing hosted PostgreSQL database and R2 bucket; this stack does not run PostgreSQL on the VM. Add the two DNS A records, then use Certbot's Nginx integration to issue certificates and enable HTTPS redirects. Certbot's renewal timer and an actual dry run should be verified.
+Populate `/opt/786/.env` from `production.env.example` and the existing backend credentials before deployment. Use the existing hosted PostgreSQL database and R2 bucket; this stack does not run PostgreSQL on the VM. Add the two DNS A records, then run `sudo /opt/786/deploy/enable-https.sh` to issue certificates and enable HTTPS redirects. Certbot's renewal timer and an actual dry run should be verified.
 
 Bootstrap creates separate Ubuntu-to-GitHub read-only keys at `~ubuntu/.ssh/786_github_{frontend,admin,backend}`. Add each `.pub` as a read-only deploy key on its matching repository. Their SSH aliases are `github-786-frontend`, `github-786-admin`, and `github-786-backend`. Example:
 
@@ -63,6 +63,6 @@ free -h
 
 Each service keeps its current and immediately preceding image. Tagged images are not globally pruned across applications. Application containers restart automatically; Nginx and Docker are enabled at boot. Backend migrations use checksums and stop the release if an already-applied migration was edited.
 
-To change domains later: update Nginx server names and certificates; update `SITE_URL` in frontend.env and `ADMIN_ORIGIN` in backend.env; update GitHub admin variable `PUBLIC_SITE_URL`; redeploy frontend/admin/backend as appropriate. The admin's `PUBLIC_SITE_URL=http://frontend:3000` is deliberately internal for authenticated cache revalidation and does not need the public hostname. Both apps share the runtime `REVALIDATE_SECRET`.
+To change domains later: edit only `PUBLIC_SITE_URL` and `ADMIN_SITE_URL` in `/opt/786/.env`, point both new DNS records at this VM, and run `sudo /opt/786/deploy/enable-https.sh`. The command derives hostnames from `.env`, obtains certificates, regenerates Nginx, and applies the app environments. No application rebuild or GitHub variable change is needed. Backend `ADMIN_ORIGIN` and frontend `SITE_URL` are derived automatically. The admin's `PUBLIC_SITE_INTERNAL_URL=http://frontend:3000` deliberately stays internal for authenticated cache refresh. Both apps receive the same canonical `REVALIDATE_SECRET`.
 
 Cloudflare can cache static assets. Do not force homepage HTML caching: the application currently invalidates its Next.js data cache, and does not purge a separate Cloudflare HTML cache. Never cache admin/auth/API mutation responses. Preserve Next.js `_rsc` query parameters and origin Cache-Control headers.

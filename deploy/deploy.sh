@@ -9,6 +9,7 @@ case "$service" in frontend|admin|backend) ;; *) exit 64 ;; esac
 exec 9>/run/lock/786-deploy.lock
 flock -w 900 9
 cd /opt/786
+python3 deploy/configure.py
 compose=(docker compose --env-file state/images.env -f deploy/compose.production.yaml)
 image="786/$service:$sha"
 variable="$(printf '%s' "$service" | tr '[:lower:]' '[:upper:]')_IMAGE"
